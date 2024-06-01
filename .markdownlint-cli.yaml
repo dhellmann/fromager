@@ -1,0 +1,14 @@
+# really, this is a rule?
+commands-show-output: false
+
+# Don't check line length
+line-length: false
+
+# We only publish HTML, so allow all HTML inline.
+no-inline-html: false
+
+# Don't require specifying code language
+fenced-code-language: false
+
+# We sometimes put URLs in docs without making them links
+no-bare-urls: false
