@@ -148,22 +148,28 @@ def handle_requirement(
     sdist_root_dir = None
 
     if not pre_built:
-        sdist_root_dir = sources.prepare_source(
-            ctx, req, source_filename, resolved_version
-        )
+        find_sdist_result = finders.find_sdist(ctx.sdists_builds, req, resolved_version)
+        try:
+            # FIXME: This will never exist when cleanup is engaged.
+            sdist_root_dir = finders.find_source_dir(
+                ctx.work_dir, req, resolved_version
+            )
+        except ValueError:
+            sdist_root_dir = None
+        if find_sdist_result and sdist_root_dir:
+            logger.debug(f"{req.name}: have source dir {sdist_root_dir}")
+        else:
+            sdist_root_dir = sources.prepare_source(
+                ctx, req, source_filename, resolved_version
+            )
         unpack_dir = sdist_root_dir.parent
 
-        next_req_type = "build_system"
         build_system_dependencies = _handle_build_system_requirements(
             ctx, req, why, sdist_root_dir
         )
-
-        next_req_type = "build_backend"
         build_backend_dependencies = _handle_build_backend_requirements(
             ctx, req, why, sdist_root_dir
         )
-
-        next_req_type = "build_sdist"
         build_sdist_dependencies = _handle_build_sdist_requirements(
             ctx, req, why, sdist_root_dir
         )
@@ -254,11 +260,11 @@ def handle_requirement(
     # Cleanup the source tree and build environment, leaving any other
     # artifacts that were created.
     if ctx.cleanup:
-        if sdist_root_dir:
+        if sdist_root_dir and sdist_root_dir.exists():
             logger.debug(f"{req.name}: cleaning up source tree {sdist_root_dir}")
             shutil.rmtree(sdist_root_dir)
             logger.debug(f"{req.name}: cleaned up source tree {sdist_root_dir}")
-        if build_env:
+        if build_env and build_env.path.exists():
             logger.debug(f"{req.name}: cleaning up build environment {build_env.path}")
             shutil.rmtree(build_env.path)
             logger.debug(f"{req.name}: cleaned up build environment {build_env.path}")
