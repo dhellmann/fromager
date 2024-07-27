@@ -150,11 +150,13 @@ def handle_requirement(
     if not pre_built:
         find_sdist_result = finders.find_sdist(ctx.sdists_builds, req, resolved_version)
         try:
-            # FIXME: This will never exist when cleanup is engaged.
             sdist_root_dir = finders.find_source_dir(
                 ctx.work_dir, req, resolved_version
             )
-        except ValueError:
+        except ValueError as err:
+            logger.debug(
+                f"{req.name}: did not find existing source dir, preparing source ({err})"
+            )
             sdist_root_dir = None
         if find_sdist_result and sdist_root_dir:
             logger.debug(f"{req.name}: have source dir {sdist_root_dir}")
@@ -263,6 +265,9 @@ def handle_requirement(
         if sdist_root_dir and sdist_root_dir.exists():
             logger.debug(f"{req.name}: cleaning up source tree {sdist_root_dir}")
             shutil.rmtree(sdist_root_dir)
+            # Recreate the directory as empty as a marker that we've processed
+            # it once, to avoid processing it again.
+            sdist_root_dir.mkdir(parents=True, exist_ok=True)
             logger.debug(f"{req.name}: cleaned up source tree {sdist_root_dir}")
         if build_env and build_env.path.exists():
             logger.debug(f"{req.name}: cleaning up build environment {build_env.path}")
