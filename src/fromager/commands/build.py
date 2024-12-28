@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import pathlib
+import queue
 import sys
 import typing
 from urllib.parse import urlparse
@@ -57,6 +58,18 @@ class BuildSequenceEntry:
         return (self.name.lower(), self.version) < (other.name.lower(), other.version)
 
 
+@dataclasses.dataclass()
+class BuildTask:
+    name: str
+    version: Version
+    prebuilt: bool
+    download_url: str
+
+    @property
+    def req(self) -> Requirement:
+        return Requirement(f"{self.name}=={self.version}")
+
+
 @click.command()
 @click.option(
     "--wheel-server-url",
@@ -104,7 +117,11 @@ def build(
         req=req,
         sdist_server_url=sdist_server_url,
     )
-    wheel_filename = _build(wkctx, version, req, source_url)
+    wheel_filename = _build(
+        wkctx,
+        BuildTask(name=dist_name, version=version, source_url=source_url),
+        force=True,
+    )
     print(wheel_filename)
 
 
@@ -156,75 +173,94 @@ def build_sequence(
             f"skipping builds for versions of packages available at {wheel_server_urls}"
         )
 
-    entries: list[BuildSequenceEntry] = []
-
     logger.info("reading build order from %s", build_order_file)
     with read.open_file_or_url(build_order_file) as f:
-        for entry in progress.progress(json.load(f)):
-            dist_name = entry["dist"]
-            resolved_version = Version(entry["version"])
-            prebuilt = entry["prebuilt"]
-            source_download_url = entry["source_url"]
+        build_order = json.load(f)
+    build_queue: queue.Queue[BuildTask] = queue.Queue()
+    for entry in build_order:
+        build_queue.put(
+            BuildTask(
+                name=entry["dist"],
+                version=Version(entry["version"]),
+                prebuilt=entry["prebuilt"],
+                source_download_url=entry["source_url"],
+            )
+        )
 
-            req = Requirement(f"{dist_name}=={resolved_version}")
+    entries: list[BuildSequenceEntry] = []
 
-            if not force:
-                is_built, wheel_filename = _is_wheel_built(
-                    wkctx, dist_name, resolved_version, wheel_server_urls
+    while True:
+        try:
+            task = build_queue.get()
+        except queue.Empty:
+            break
+
+        dist_name = task.name
+        resolved_version = task.version
+        prebuilt = task.prebuilt
+        source_download_url = task.download_url
+
+        req = Requirement(f"{dist_name}=={resolved_version}")
+
+        if not force:
+            is_built, wheel_filename = _is_wheel_built(
+                wkctx, dist_name, resolved_version, wheel_server_urls
+            )
+            if is_built:
+                logger.info(
+                    "%s: skipping building wheels for %s==%s since it already exists",
+                    dist_name,
+                    dist_name,
+                    resolved_version,
                 )
-                if is_built:
-                    logger.info(
-                        "%s: skipping building wheels for %s==%s since it already exists",
-                        dist_name,
+                entries.append(
+                    BuildSequenceEntry(
                         dist_name,
                         resolved_version,
+                        prebuilt,
+                        source_download_url,
+                        wheel_filename=wheel_filename,
+                        skipped=True,
                     )
-                    entries.append(
-                        BuildSequenceEntry(
-                            dist_name,
-                            resolved_version,
-                            prebuilt,
-                            source_download_url,
-                            wheel_filename=wheel_filename,
-                            skipped=True,
-                        )
-                    )
-                    continue
+                )
+                continue
 
-            if prebuilt:
-                logger.info(
-                    "%s: downloading prebuilt wheel %s==%s",
-                    dist_name,
-                    dist_name,
-                    resolved_version,
-                )
-                wheel_filename = wheels.download_wheel(
-                    req=req,
-                    wheel_url=source_download_url,
-                    output_directory=wkctx.wheels_build,
-                )
-            else:
-                logger.info(
-                    "%s: building %s==%s", dist_name, dist_name, resolved_version
-                )
-                wheel_filename = _build(
-                    wkctx, resolved_version, req, source_download_url
-                )
-
-            server.update_wheel_mirror(wkctx)
-            # After we update the wheel mirror, the built file has
-            # moved to a new directory.
-            wheel_filename = wkctx.wheels_downloads / wheel_filename.name
-            entries.append(
-                BuildSequenceEntry(
-                    dist_name,
-                    resolved_version,
-                    prebuilt,
-                    source_download_url,
-                    wheel_filename=wheel_filename,
-                )
+        if prebuilt:
+            logger.info(
+                "%s: downloading prebuilt wheel %s==%s",
+                dist_name,
+                dist_name,
+                resolved_version,
             )
-            print(wheel_filename)
+            wheel_filename = wheels.download_wheel(
+                req=req,
+                wheel_url=source_download_url,
+                output_directory=wkctx.wheels_build,
+            )
+        else:
+            logger.info("%s: building %s==%s", dist_name, dist_name, resolved_version)
+            wheel_filename = _build(
+                wkctx=wkctx,
+                resolved_version=resolved_version,
+                req=req,
+                source_download_url=source_download_url,
+                force=force,
+            )
+
+        server.update_wheel_mirror(wkctx)
+        # After we update the wheel mirror, the built file has
+        # moved to a new directory.
+        wheel_filename = wkctx.wheels_downloads / wheel_filename.name
+        entries.append(
+            BuildSequenceEntry(
+                dist_name,
+                resolved_version,
+                prebuilt,
+                source_download_url,
+                wheel_filename=wheel_filename,
+            )
+        )
+        print(wheel_filename)
     metrics.summarize(wkctx, "Building")
 
     _summary(wkctx, entries)
@@ -329,13 +365,12 @@ def _create_table(entries: list[BuildSequenceEntry], **table_kwargs) -> Table:
 
 def _build(
     wkctx: context.WorkContext,
-    resolved_version: Version,
-    req: Requirement,
-    source_download_url: str,
+    build_task: BuildTask,
+    force: bool,
 ) -> pathlib.Path:
     per_wheel_logger = logging.getLogger("")
 
-    module_name = overrides.pkgname_to_override_module(req.name)
+    module_name = overrides.pkgname_to_override_module(build_task.name)
     log_filename = module_name + "_current.log"
 
     wheel_log = wkctx.logs_dir / log_filename
