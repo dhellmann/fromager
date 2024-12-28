@@ -3,6 +3,7 @@ import json
 import logging
 import pathlib
 import sys
+import textwrap
 import typing
 
 import click
@@ -273,3 +274,85 @@ def migrate_graph(
             graph.serialize(f)
     else:
         graph.serialize(sys.stdout)
+
+
+class MakeNode:
+    def __init__(self, dist_name: str, dist_version: Version | None = None):
+        if dist_version:
+            self.target_name = f"{dist_name}__{dist_version}"
+        else:
+            self.target_name = dist_name
+        self.dist_name = dist_name
+        self.dist_version = dist_version
+        self.dependencies: list[MakeNode] = []
+
+    def add_dependency(self, other: "MakeNode"):
+        self.dependencies.append(other)
+
+    def __str__(self):
+        dependency_names = [d.target_name for d in self.dependencies]
+        command = f"fromager build $(WHEEL_SERVER_ARGS) {self.dist_name} {self.dist_version} $(SDIST_SERVER_URL)"
+        rules: list[str] = [
+            textwrap.dedent(f"""
+            # {self.dist_name}=={self.dist_version}
+            .PHONY: {self.target_name}
+            {self.target_name}: {", ".join(dependency_names)}
+            \t{command}
+            """)
+        ]
+        rules.extend(str(d) for d in self.dependencies)
+        return "".join(rules)
+
+    @classmethod
+    def from_graph_node(cls, node: DependencyNode) -> "MakeNode":
+        mn = MakeNode(node.canonicalized_name, node.version)
+        for child_edge in node.children:
+            if child_edge.req_type != RequirementType.BUILD:
+                continue
+            child = cls.from_graph_node(child_edge.destination_node)
+            mn.add_dependency(child)
+        return mn
+
+
+@graph.command()
+@click.option(
+    "--wheel-server-url",
+    default="",
+    type=str,
+    help="URL for the wheel server for builds",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=clickext.ClickPath(),
+)
+@click.argument(
+    "graph-file",
+    type=clickext.ClickPath(),
+)
+@click.argument("sdist_server_url")
+@click.pass_obj
+def to_makefile(
+    wkctx: context.WorkContext,
+    wheel_server_url: str,
+    graph_file: pathlib.Path,
+    output: pathlib.Path,
+    sdist_server_url: str,
+):
+    "Convert a build graph to a Makefile for building wheels"
+    graph = DependencyGraph.from_file(graph_file)
+    top = MakeNode("all")
+    for edge in graph.get_root_node().children:
+        child = MakeNode.from_graph_node(edge.destination_node)
+        top.add_dependency(child)
+    if wheel_server_url:
+        wheel_server_args = f"--wheel-server-url {wheel_server_url}"
+    else:
+        wheel_server_args = ""
+    print(
+        textwrap.dedent(f"""
+          SDIST_SERVER_URL="{sdist_server_url}"
+          WHEEL_SERVER_ARGS="{wheel_server_args}"
+          """)
+    )
+    print(str(top))
