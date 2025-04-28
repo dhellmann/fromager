@@ -18,6 +18,7 @@ from requests.exceptions import ChunkedEncodingError, ConnectionError
 from urllib3.exceptions import IncompleteRead, ProtocolError
 
 from . import (
+    build_environment,
     dependencies,
     external_commands,
     metrics,
@@ -534,6 +535,7 @@ def build_sdist(
             req=req,
             sdist_root_dir=sdist_root_dir,
             version=version,
+            build_env=build_env,
         )
     else:
         sdist_filename = overrides.find_and_invoke(
@@ -598,6 +600,7 @@ def pep517_build_sdist(
     req: Requirement,
     sdist_root_dir: pathlib.Path,
     version: Version,
+    build_env: build_environment.BuildEnvironment,
 ) -> pathlib.Path:
     """Use the PEP 517 API to build a source distribution from a modified source tree."""
     pbi = ctx.package_build_info(req)
@@ -607,6 +610,7 @@ def pep517_build_sdist(
         req=req,
         build_dir=build_dir,
         override_environ=extra_environ,
+        build_env=build_env,
     )
     sdist_filename = hook_caller.build_sdist(
         ctx.sdists_builds,

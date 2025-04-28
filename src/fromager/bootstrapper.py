@@ -214,9 +214,16 @@ class Bootstrapper:
             assert sdist_root_dir is not None
             unpack_dir = sdist_root_dir.parent
 
+            build_env = build_environment.BuildEnvironment(
+                ctx=self.ctx,
+                parent_dir=sdist_root_dir.parent,
+                build_requirements=None,
+                req=req,
+            )
+
             # need to call this function irrespective of whether we had the wheel cached
             # so that the build dependencies can be bootstrapped
-            build_dependencies = self._prepare_build_dependencies(req, sdist_root_dir)
+            self._prepare_build_dependencies(req, sdist_root_dir, build_env)
 
             if cached_wheel_filename:
                 logger.debug(
@@ -234,8 +241,8 @@ class Bootstrapper:
                     f"{req.name}=={resolved_version} ({req_type})"
                 )
                 wheel_filename = None
-                sdist_filename, build_env = self._build_sdist(
-                    req, resolved_version, sdist_root_dir, build_dependencies
+                sdist_filename = self._build_sdist(
+                    req, resolved_version, sdist_root_dir, build_env
                 )
             else:
                 # build wheel (build requirements, full build mode)
@@ -243,8 +250,8 @@ class Bootstrapper:
                     f"building wheel {req.name}=={resolved_version} "
                     f"to get install requirements ({req_type})"
                 )
-                wheel_filename, sdist_filename, build_env = self._build_wheel(
-                    req, resolved_version, sdist_root_dir, build_dependencies
+                wheel_filename, sdist_filename = self._build_wheel(
+                    req, resolved_version, sdist_root_dir, build_env
                 )
 
         hooks.run_post_bootstrap_hooks(
@@ -324,14 +331,8 @@ class Bootstrapper:
         req: Requirement,
         resolved_version: Version,
         sdist_root_dir: pathlib.Path,
-        build_dependencies: set[Requirement],
-    ) -> tuple[pathlib.Path, build_environment.BuildEnvironment]:
-        build_env = build_environment.BuildEnvironment(
-            ctx=self.ctx,
-            parent_dir=sdist_root_dir.parent,
-            build_requirements=build_dependencies,
-            req=req,
-        )
+        build_env: build_environment.BuildEnvironment,
+    ) -> pathlib.Path:
         try:
             find_sdist_result = finders.find_sdist(
                 self.ctx, self.ctx.sdists_builds, req, str(resolved_version)
@@ -351,17 +352,18 @@ class Bootstrapper:
                 )
         except Exception as err:
             logger.warning(f"failed to build source distribution: {err}")
-        return (sdist_filename, build_env)
+            raise
+        return sdist_filename
 
     def _build_wheel(
         self,
         req: Requirement,
         resolved_version: Version,
         sdist_root_dir: pathlib.Path,
-        build_dependencies: set[Requirement],
-    ) -> tuple[pathlib.Path, pathlib.Path, build_environment.BuildEnvironment]:
-        sdist_filename, build_env = self._build_sdist(
-            req, resolved_version, sdist_root_dir, build_dependencies
+        build_env: build_environment.BuildEnvironment,
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        sdist_filename = self._build_sdist(
+            req, resolved_version, sdist_root_dir, build_env
         )
 
         logger.info(f"starting build of {self._explain} for {self.ctx.variant}")
@@ -377,22 +379,34 @@ class Bootstrapper:
         # downloads directory.
         wheel_filename = self.ctx.wheels_downloads / built_filename.name
         logger.info(f"built wheel for version {resolved_version}: {wheel_filename}")
-        return wheel_filename, sdist_filename, build_env
+        return wheel_filename, sdist_filename
 
     def _prepare_build_dependencies(
-        self, req: Requirement, sdist_root_dir: pathlib.Path
+        self,
+        req: Requirement,
+        sdist_root_dir: pathlib.Path,
+        build_env: build_environment.BuildEnvironment,
     ) -> set[Requirement]:
+        # build system
         build_system_dependencies = dependencies.get_build_system_dependencies(
-            ctx=self.ctx, req=req, sdist_root_dir=sdist_root_dir
+            ctx=self.ctx,
+            req=req,
+            sdist_root_dir=sdist_root_dir,
         )
         self._handle_build_requirements(
             req,
             RequirementType.BUILD_SYSTEM,
             build_system_dependencies,
         )
+        # The next hooks need build system requirements.
+        build_env.install(build_system_dependencies)
 
+        # build backend
         build_backend_dependencies = dependencies.get_build_backend_dependencies(
-            ctx=self.ctx, req=req, sdist_root_dir=sdist_root_dir
+            ctx=self.ctx,
+            req=req,
+            sdist_root_dir=sdist_root_dir,
+            build_env=build_env,
         )
         self._handle_build_requirements(
             req,
@@ -400,14 +414,22 @@ class Bootstrapper:
             build_backend_dependencies,
         )
 
+        # build sdist
         build_sdist_dependencies = dependencies.get_build_sdist_dependencies(
-            ctx=self.ctx, req=req, sdist_root_dir=sdist_root_dir
+            ctx=self.ctx,
+            req=req,
+            sdist_root_dir=sdist_root_dir,
+            build_env=build_env,
         )
         self._handle_build_requirements(
             req,
             RequirementType.BUILD_SDIST,
             build_sdist_dependencies,
         )
+
+        build_dependencies = build_sdist_dependencies | build_backend_dependencies
+        if build_dependencies.isdisjoint(build_system_dependencies):
+            build_env.install(build_dependencies)
 
         return (
             build_system_dependencies
@@ -426,20 +448,10 @@ class Bootstrapper:
         for dep in self._sort_requirements(build_dependencies):
             token = requirement_ctxvar.set(dep)
             try:
-                resolved = self.bootstrap(req=dep, req_type=build_type)
+                self.bootstrap(req=dep, req_type=build_type)
             except Exception as err:
                 requirement_ctxvar.reset(token)
                 raise ValueError(f"could not handle {self._explain}") from err
-            # We may need these dependencies installed in order to run build hooks
-            # Example: frozenlist build-system.requires includes expandvars because
-            # it is used by the packaging/pep517_backend/ build backend
-            build_environment.maybe_install(
-                ctx=self.ctx,
-                req=req,
-                dep=dep,
-                dep_version=str(resolved),
-                dep_req_type=build_type,
-            )
             self.progressbar.update()
             requirement_ctxvar.reset(token)
 

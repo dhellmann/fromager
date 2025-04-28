@@ -95,6 +95,7 @@ def get_build_backend_dependencies(
     ctx: context.WorkContext,
     req: Requirement,
     sdist_root_dir: pathlib.Path,
+    build_env: build_environment.BuildEnvironment,
 ) -> set[Requirement]:
     logger.info(f"getting build backend dependencies for {req} in {sdist_root_dir}")
     pbi = ctx.package_build_info(req)
@@ -106,7 +107,7 @@ def get_build_backend_dependencies(
         )
         return _read_requirements_file(build_backend_req_file)
 
-    extra_environ = pbi.get_extra_environ()
+    extra_environ = pbi.get_extra_environ(build_env=build_env)
     orig_deps = overrides.find_and_invoke(
         req.name,
         "get_build_backend_dependencies",
@@ -116,6 +117,7 @@ def get_build_backend_dependencies(
         sdist_root_dir=sdist_root_dir,
         build_dir=pbi.build_dir(sdist_root_dir),
         extra_environ=extra_environ,
+        build_env=build_env,
     )
     deps = _filter_requirements(req, orig_deps)
 
@@ -132,6 +134,7 @@ def default_get_build_backend_dependencies(
     sdist_root_dir: pathlib.Path,
     build_dir: pathlib.Path,
     extra_environ: dict[str, str],
+    build_env: build_environment.BuildEnvironment,
 ) -> typing.Iterable[str]:
     """Get build backend dependencies
 
@@ -144,6 +147,7 @@ def default_get_build_backend_dependencies(
         req=req,
         build_dir=build_dir,
         override_environ=extra_environ,
+        build_env=build_env,
     )
     return hook_caller.get_requires_for_build_wheel(
         config_settings=pbi.config_settings,
@@ -155,6 +159,7 @@ def get_build_sdist_dependencies(
     ctx: context.WorkContext,
     req: Requirement,
     sdist_root_dir: pathlib.Path,
+    build_env: build_environment.BuildEnvironment,
 ) -> set[Requirement]:
     logger.info(f"getting build sdist dependencies for {req} in {sdist_root_dir}")
     pbi = ctx.package_build_info(req)
@@ -166,7 +171,7 @@ def get_build_sdist_dependencies(
         )
         return _read_requirements_file(build_sdist_req_file)
 
-    extra_environ = pbi.get_extra_environ()
+    extra_environ = pbi.get_extra_environ(build_env=build_env)
     orig_deps = overrides.find_and_invoke(
         req.name,
         "get_build_sdist_dependencies",
@@ -176,6 +181,7 @@ def get_build_sdist_dependencies(
         sdist_root_dir=sdist_root_dir,
         build_dir=pbi.build_dir(sdist_root_dir),
         extra_environ=extra_environ,
+        build_env=build_env,
     )
     deps = _filter_requirements(req, orig_deps)
 
@@ -192,6 +198,7 @@ def default_get_build_sdist_dependencies(
     sdist_root_dir: pathlib.Path,
     build_dir: pathlib.Path,
     extra_environ: dict[str, str],
+    build_env: build_environment.BuildEnvironment,
 ) -> typing.Iterable[str]:
     """Get build sdist dependencies
 
@@ -204,6 +211,7 @@ def default_get_build_sdist_dependencies(
         req=req,
         build_dir=build_dir,
         override_environ=extra_environ,
+        build_env=build_env,
     )
     return hook_caller.get_requires_for_build_wheel(
         config_settings=pbi.config_settings,
@@ -224,7 +232,7 @@ def get_install_dependencies_of_sdist(
     pbi = ctx.package_build_info(req)
     build_dir = pbi.build_dir(sdist_root_dir)
     logger.info(f"getting install requirements for {req} from sdist in {build_dir}")
-    extra_environ = pbi.get_extra_environ()
+    extra_environ = pbi.get_extra_environ(build_env=build_env)
     hook_caller = get_build_backend_hook_caller(
         ctx=ctx,
         req=req,
@@ -307,7 +315,7 @@ def get_build_backend_hook_caller(
     req: Requirement,
     build_dir: pathlib.Path,
     override_environ: dict[str, typing.Any],
-    build_env: build_environment.BuildEnvironment | None = None,
+    build_env: build_environment.BuildEnvironment,
 ) -> pyproject_hooks.BuildBackendHookCaller:
     """Create pyproject_hooks build backend caller"""
 
@@ -321,12 +329,9 @@ def get_build_backend_hook_caller(
         also needs env vars from the build environment's virtualenv. Merge
         the 3 sets of values before calling the actual runner function.
         """
-        if typing.TYPE_CHECKING:
-            assert build_env is not None
         extra_environ = dict(extra_environ) if extra_environ else {}
         extra_environ.update(override_environ)
-        if build_env is not None:
-            extra_environ.update(build_env.get_venv_environ(template_env=extra_environ))
+        extra_environ.update(build_env.get_venv_environ(template_env=extra_environ))
         external_commands.run(
             cmd,
             cwd=cwd,
@@ -336,14 +341,13 @@ def get_build_backend_hook_caller(
 
     pyproject_toml = get_pyproject_contents(build_dir)
     backend = get_build_backend(pyproject_toml)
-    python_executable = str(build_env.python) if build_env is not None else None
 
     return pyproject_hooks.BuildBackendHookCaller(
         source_dir=str(build_dir),
         build_backend=backend["build-backend"],
         backend_path=backend["backend-path"],
         runner=_run_hook_with_extra_environ,
-        python_executable=python_executable,
+        python_executable=str(build_env.python),
     )
 
 

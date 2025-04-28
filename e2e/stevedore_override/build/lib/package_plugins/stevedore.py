@@ -23,4 +23,5 @@ def build_sdist(
         req=req,
         sdist_root_dir=sdist_root_dir,
         version=version,
+        build_env=build_env,
     )
