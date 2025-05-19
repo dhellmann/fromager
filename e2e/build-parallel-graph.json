@@ -1,0 +1,311 @@
+{
+  "": {
+    "download_url": "",
+    "pre_built": false,
+    "version": "0",
+    "canonicalized_name": "",
+    "edges": [
+      {
+        "key": "imapautofiler==1.14.0",
+        "req_type": "toplevel",
+        "req": "imapautofiler==1.14.0"
+      }
+    ]
+  },
+  "imapautofiler==1.14.0": {
+    "download_url": "https://files.pythonhosted.org/packages/e5/ac/5715b2616657b06dab8e44fc51d51d8736ef0ba758e479cba9343254fba5/imapautofiler-1.14.0.tar.gz#sha256=dae2edb315994a906bcea3d8bf372adfd62805e7ada8e3a0a3d032595a600d89",
+    "pre_built": false,
+    "version": "1.14.0",
+    "canonicalized_name": "imapautofiler",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools"
+      },
+      {
+        "key": "setuptools-scm==8.3.1",
+        "req_type": "build-system",
+        "req": "setuptools_scm[toml]>=6.2"
+      },
+      {
+        "key": "pyyaml==6.0.2",
+        "req_type": "install",
+        "req": "PyYAML>=3.11"
+      },
+      {
+        "key": "imapclient==3.0.1",
+        "req_type": "install",
+        "req": "imapclient>=2.2.0"
+      },
+      {
+        "key": "jinja2==3.1.6",
+        "req_type": "install",
+        "req": "jinja2>=2.11.2"
+      },
+      {
+        "key": "keyring==25.6.0",
+        "req_type": "install",
+        "req": "keyring>=10.0.0"
+      }
+    ]
+  },
+  "keyring==25.6.0": {
+    "download_url": "https://files.pythonhosted.org/packages/70/09/d904a6e96f76ff214be59e7aa6ef7190008f52a0ab6689760a98de0bf37d/keyring-25.6.0.tar.gz#sha256=0b39998aa941431eb3d9b0d4b2460bc773b9df6fed7621c2dfb291a7e0187a66",
+    "pre_built": false,
+    "version": "25.6.0",
+    "canonicalized_name": "keyring",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=61.2"
+      },
+      {
+        "key": "setuptools-scm==8.3.1",
+        "req_type": "build-system",
+        "req": "setuptools_scm[toml]>=3.4.1"
+      },
+      {
+        "key": "jaraco-classes==3.4.0",
+        "req_type": "install",
+        "req": "jaraco.classes"
+      },
+      {
+        "key": "jaraco-context==6.0.1",
+        "req_type": "install",
+        "req": "jaraco.context"
+      },
+      {
+        "key": "jaraco-functools==4.1.0",
+        "req_type": "install",
+        "req": "jaraco.functools"
+      }
+    ]
+  },
+  "jaraco-functools==4.1.0": {
+    "download_url": "https://files.pythonhosted.org/packages/ab/23/9894b3df5d0a6eb44611c36aec777823fc2e07740dabbd0b810e19594013/jaraco_functools-4.1.0.tar.gz#sha256=70f7e0e2ae076498e212562325e805204fc092d7b4c17e0e86c959e249701a9d",
+    "pre_built": false,
+    "version": "4.1.0",
+    "canonicalized_name": "jaraco-functools",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=61.2"
+      },
+      {
+        "key": "setuptools-scm==8.3.1",
+        "req_type": "build-system",
+        "req": "setuptools_scm[toml]>=3.4.1"
+      },
+      {
+        "key": "more-itertools==10.7.0",
+        "req_type": "install",
+        "req": "more_itertools"
+      }
+    ]
+  },
+  "more-itertools==10.7.0": {
+    "download_url": "https://files.pythonhosted.org/packages/ce/a0/834b0cebabbfc7e311f30b46c8188790a37f89fc8d756660346fe5abfd09/more_itertools-10.7.0.tar.gz#sha256=9fddd5403be01a94b204faadcff459ec3568cf110265d3c54323e1e866ad29d3",
+    "pre_built": false,
+    "version": "10.7.0",
+    "canonicalized_name": "more-itertools",
+    "edges": [
+      {
+        "key": "flit-core==3.12.0",
+        "req_type": "build-system",
+        "req": "flit_core<4,>=3.2"
+      }
+    ]
+  },
+  "flit-core==3.12.0": {
+    "download_url": "https://files.pythonhosted.org/packages/69/59/b6fc2188dfc7ea4f936cd12b49d707f66a1cb7a1d2c16172963534db741b/flit_core-3.12.0.tar.gz#sha256=18f63100d6f94385c6ed57a72073443e1a71a4acb4339491615d0f16d6ff01b2",
+    "pre_built": false,
+    "version": "3.12.0",
+    "canonicalized_name": "flit-core",
+    "edges": []
+  },
+  "setuptools-scm==8.3.1": {
+    "download_url": "https://files.pythonhosted.org/packages/b9/19/7ae64b70b2429c48c3a7a4ed36f50f94687d3bfcd0ae2f152367b6410dff/setuptools_scm-8.3.1.tar.gz#sha256=3d555e92b75dacd037d32bafdf94f97af51ea29ae8c7b234cf94b7a5bd242a63",
+    "pre_built": false,
+    "version": "8.3.1",
+    "canonicalized_name": "setuptools-scm",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=61"
+      },
+      {
+        "key": "packaging==25.0",
+        "req_type": "build-system",
+        "req": "packaging>=20"
+      },
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools"
+      }
+    ]
+  },
+  "setuptools==80.8.0": {
+    "download_url": "https://files.pythonhosted.org/packages/8d/d2/ec1acaaff45caed5c2dedb33b67055ba9d4e96b091094df90762e60135fe/setuptools-80.8.0.tar.gz#sha256=49f7af965996f26d43c8ae34539c8d99c5042fbff34302ea151eaa9c207cd257",
+    "pre_built": false,
+    "version": "80.8.0",
+    "canonicalized_name": "setuptools",
+    "edges": []
+  },
+  "packaging==25.0": {
+    "download_url": "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-25.0.tar.gz#sha256=d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f",
+    "pre_built": false,
+    "version": "25.0",
+    "canonicalized_name": "packaging",
+    "edges": [
+      {
+        "key": "flit-core==3.12.0",
+        "req_type": "build-system",
+        "req": "flit_core>=3.3"
+      }
+    ]
+  },
+  "jaraco-context==6.0.1": {
+    "download_url": "https://files.pythonhosted.org/packages/df/ad/f3777b81bf0b6e7bc7514a1656d3e637b2e8e15fab2ce3235730b3e7a4e6/jaraco_context-6.0.1.tar.gz#sha256=9bae4ea555cf0b14938dc0aee7c9f32ed303aa20a3b73e7dc80111628792d1b3",
+    "pre_built": false,
+    "version": "6.0.1",
+    "canonicalized_name": "jaraco-context",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=61.2"
+      },
+      {
+        "key": "setuptools-scm==8.3.1",
+        "req_type": "build-system",
+        "req": "setuptools_scm[toml]>=3.4.1"
+      }
+    ]
+  },
+  "jaraco-classes==3.4.0": {
+    "download_url": "https://files.pythonhosted.org/packages/06/c0/ed4a27bc5571b99e3cff68f8a9fa5b56ff7df1c2251cc715a652ddd26402/jaraco.classes-3.4.0.tar.gz#sha256=47a024b51d0239c0dd8c8540c6c7f484be3b8fcf0b2d85c13825780d3b3f3acd",
+    "pre_built": false,
+    "version": "3.4.0",
+    "canonicalized_name": "jaraco-classes",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=56"
+      },
+      {
+        "key": "setuptools-scm==8.3.1",
+        "req_type": "build-system",
+        "req": "setuptools_scm[toml]>=3.4.1"
+      },
+      {
+        "key": "more-itertools==10.7.0",
+        "req_type": "install",
+        "req": "more_itertools"
+      }
+    ]
+  },
+  "jinja2==3.1.6": {
+    "download_url": "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz#sha256=0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d",
+    "pre_built": false,
+    "version": "3.1.6",
+    "canonicalized_name": "jinja2",
+    "edges": [
+      {
+        "key": "flit-core==3.12.0",
+        "req_type": "build-system",
+        "req": "flit_core<4"
+      },
+      {
+        "key": "markupsafe==3.0.2",
+        "req_type": "install",
+        "req": "MarkupSafe>=2.0"
+      }
+    ]
+  },
+  "markupsafe==3.0.2": {
+    "download_url": "https://files.pythonhosted.org/packages/b2/97/5d42485e71dfc078108a86d6de8fa46db44a1a9295e89c5d6d4a06e23a62/markupsafe-3.0.2.tar.gz#sha256=ee55d3edf80167e48ea11a923c7386f4669df67d7994554387f84e7d8b0a2bf0",
+    "pre_built": false,
+    "version": "3.0.2",
+    "canonicalized_name": "markupsafe",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=70.1"
+      }
+    ]
+  },
+  "imapclient==3.0.1": {
+    "download_url": "https://files.pythonhosted.org/packages/b6/63/0eea51c9c263c18021cdc5866def55c98393f3bd74bbb8e3053e36f0f81a/IMAPClient-3.0.1.zip#sha256=78e6d62fbfbbe233e1f0e0e993160fd665eb1fd35973acddc61c15719b22bc02",
+    "pre_built": false,
+    "version": "3.0.1",
+    "canonicalized_name": "imapclient",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=40.8.0"
+      }
+    ]
+  },
+  "pyyaml==6.0.2": {
+    "download_url": "https://files.pythonhosted.org/packages/54/ed/79a089b6be93607fa5cdaedf301d7dfb23af5f25c398d5ead2525b063e17/pyyaml-6.0.2.tar.gz#sha256=d584d9ec91ad65861cc08d42e834324ef890a082e591037abe114850ff7bbc3e",
+    "pre_built": false,
+    "version": "6.0.2",
+    "canonicalized_name": "pyyaml",
+    "edges": [
+      {
+        "key": "cython==3.1.1",
+        "req_type": "build-system",
+        "req": "Cython; python_version < \"3.13\""
+      },
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools"
+      },
+      {
+        "key": "wheel==0.46.1",
+        "req_type": "build-system",
+        "req": "wheel"
+      }
+    ]
+  },
+  "wheel==0.46.1": {
+    "download_url": "https://files.pythonhosted.org/packages/fb/62/e90918c4558b002726ab930863c0cbd3e7cf9a7befa1d4a1a240cecdb379/wheel-0.46.1.tar.gz#sha256=fd477efb5da0f7df1d3c76c73c14394002c844451bd63229d8570f376f5e6a38",
+    "pre_built": false,
+    "version": "0.46.1",
+    "canonicalized_name": "wheel",
+    "edges": [
+      {
+        "key": "flit-core==3.12.0",
+        "req_type": "build-system",
+        "req": "flit_core<4,>=3.8"
+      },
+      {
+        "key": "packaging==25.0",
+        "req_type": "build-system",
+        "req": "packaging>=24.0"
+      }
+    ]
+  },
+  "cython==3.1.1": {
+    "download_url": "https://files.pythonhosted.org/packages/5b/d3/bb000603e46144db2e5055219bbddcf7ab3b10012fcb342695694fb88141/cython-3.1.1.tar.gz#sha256=505ccd413669d5132a53834d792c707974248088c4f60c497deb1b416e366397",
+    "pre_built": false,
+    "version": "3.1.1",
+    "canonicalized_name": "cython",
+    "edges": [
+      {
+        "key": "setuptools==80.8.0",
+        "req_type": "build-system",
+        "req": "setuptools>=40.8.0"
+      }
+    ]
+  }
+}

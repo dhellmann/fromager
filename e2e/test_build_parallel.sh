@@ -7,19 +7,33 @@ SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPTDIR/common.sh"
 
 # What are we building?
-DIST="stevedore"
-VERSION="5.2.0"
+DIST="imapautofiler"
+VERSION="1.14.0"
 
-# Bootstrap the test project
-fromager \
-    --sdists-repo="$OUTDIR/sdists-repo" \
-    --wheels-repo="$OUTDIR/wheels-repo" \
-    --work-dir="$OUTDIR/work-dir" \
-    --settings-dir="$SCRIPTDIR/changelog_settings" \
-    bootstrap "${DIST}==${VERSION}"
+# # Bootstrap the test project
+# fromager \
+#     --sdists-repo="$OUTDIR/sdists-repo" \
+#     --wheels-repo="$OUTDIR/wheels-repo" \
+#     --work-dir="$OUTDIR/work-dir" \
+#     --settings-dir="$SCRIPTDIR/changelog_settings" \
+#     bootstrap "${DIST}==${VERSION}"
 
 # Save the build order file but remove everything else.
-cp "$OUTDIR/work-dir/build-order.json" "$OUTDIR/"
+# cp "$OUTDIR/work-dir/graph.json" "$OUTDIR/"
+
+# Copy the cached graph file to the working directory
+cp "$SCRIPTDIR/build-parallel-graph.json" "$OUTDIR/graph.json"
+
+# Build everything a first time
+log="$OUTDIR/build-logs/${DIST}-build.log"
+fromager \
+    --debug \
+    --log-file "$log" \
+    --work-dir "$OUTDIR/work-dir" \
+    --sdists-repo "$OUTDIR/sdists-repo" \
+    --wheels-repo "$OUTDIR/wheels-repo" \
+    --settings-dir="$SCRIPTDIR/changelog_settings" \
+    build-parallel "$OUTDIR/graph.json"
 
 # Rebuild everything even if it already exists
 log="$OUTDIR/build-logs/${DIST}-build.log"
@@ -29,28 +43,25 @@ fromager \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
     --settings-dir="$SCRIPTDIR/changelog_settings" \
-    build-sequence --force "$OUTDIR/build-order.json"
+    build-parallel --force "$OUTDIR/graph.json"
 
 find "$OUTDIR/wheels-repo/"
 
-if grep -q "skipping building wheel for stevedore" "$log"; then
-  echo "Found message indicating build of stevedore was skipped" 1>&2
+if grep -q "skipping building wheel for $DIST" "$log"; then
+  echo "Found message indicating build of $DIST was skipped" 1>&2
   pass=false
 fi
 
 
 EXPECTED_FILES="
 $OUTDIR/wheels-repo/downloads/setuptools-*.whl
-$OUTDIR/wheels-repo/downloads/pbr-*.whl
-$OUTDIR/wheels-repo/downloads/stevedore-*.whl
+$OUTDIR/wheels-repo/downloads/$DIST-*.whl
 
-$OUTDIR/sdists-repo/downloads/stevedore-*.tar.gz
+$OUTDIR/sdists-repo/downloads/$DIST-*.tar.gz
 $OUTDIR/sdists-repo/downloads/setuptools-*.tar.gz
-$OUTDIR/sdists-repo/downloads/pbr-*.tar.gz
 
-$OUTDIR/work-dir/logs/stevedore-*.log
+$OUTDIR/work-dir/logs/$DIST-*.log
 $OUTDIR/work-dir/logs/setuptools-*.log
-$OUTDIR/work-dir/logs/pbr-*.log
 
 $OUTDIR/work-dir/build-sequence-summary.md
 $OUTDIR/work-dir/build-sequence-summary.json
@@ -74,7 +85,7 @@ fromager \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
     --settings-dir="$SCRIPTDIR/changelog_settings" \
-    build-sequence "$OUTDIR/build-order.json"
+    build-parallel "$OUTDIR/graph.json"
 
 find "$OUTDIR/wheels-repo/"
 
@@ -82,8 +93,8 @@ if ! grep -q "skipping builds for versions of packages available" "$log"; then
   echo "Did not find message indicating builds would be skipped" 1>&2
   pass=false
 fi
-if ! grep -q "skipping building wheels for stevedore" "$log"; then
-  echo "Did not find message indicating build of stevedore was skipped" 1>&2
+if ! grep -q "skipping building wheel for $DIST" "$log"; then
+  echo "Did not find message indicating build of $DIST was skipped" 1>&2
   pass=false
 fi
 
@@ -97,7 +108,7 @@ fromager \
     --work-dir "$OUTDIR/work-dir" \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
-    build-sequence --cache-wheel-server-url="https://pypi.org/simple" "$OUTDIR/build-order.json"
+    build-parallel --cache-wheel-server-url="https://pypi.org/simple" "$OUTDIR/graph.json"
 
 find "$OUTDIR/wheels-repo/"
 
@@ -105,8 +116,8 @@ if ! grep -q "skipping builds for versions of packages available" "$log"; then
   echo "Did not find message indicating builds would be skipped" 1>&2
   pass=false
 fi
-if ! grep -q "skipping building wheels for stevedore" "$log"; then
-  echo "Did not find message indicating build of stevedore was skipped" 1>&2
+if ! grep -q "skipping building wheel for $DIST" "$log"; then
+  echo "Did not find message indicating build of $DIST was skipped" 1>&2
   pass=false
 fi
 
