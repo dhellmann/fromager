@@ -181,7 +181,7 @@ def build_sequence(
                 )
                 if is_built:
                     logger.info(
-                        "%s: skipping building wheels for %s==%s since it already exists",
+                        "%s: skipping building wheel for %s==%s since it already exists",
                         dist_name,
                         dist_name,
                         resolved_version,
@@ -547,72 +547,75 @@ def build_parallel(
                 )
                 continue
         nodes_to_build.append(node)
+    logger.info("found %d packages to build", len(nodes_to_build))
 
     # Sort nodes by their dependencies to ensure we build in the right order
     # A node can be built when all of its build dependencies are built
     built_nodes = set()
     entries: list[BuildSequenceEntry] = []
 
-    while nodes_to_build:
-        # Find nodes that can be built (all build dependencies are built)
-        buildable_nodes = []
-        for node in nodes_to_build:
-            # Get all build dependencies (build-system, build-backend, build-sdist)
-            build_deps = [
-                edge.destination_node
-                for edge in node.children
-                if edge.req_type.is_build_requirement
-            ]
-            # A node can be built when all of its build dependencies are built
-            if all(dep.key in built_nodes for dep in build_deps):
-                buildable_nodes.append(node)
+    with progress.progress_context(total=len(nodes_to_build)) as progressbar:
+        while nodes_to_build:
+            # Find nodes that can be built (all build dependencies are built)
+            buildable_nodes = []
+            for node in nodes_to_build:
+                # Get all build dependencies (build-system, build-backend, build-sdist)
+                build_deps = [
+                    edge.destination_node
+                    for edge in node.children
+                    if edge.req_type.is_build_requirement
+                ]
+                # A node can be built when all of its build dependencies are built
+                if all(dep.key in built_nodes for dep in build_deps):
+                    buildable_nodes.append(node)
 
-        if not buildable_nodes:
-            # If we can't build anything but still have nodes, we have a cycle
-            remaining = [n.key for n in nodes_to_build]
-            raise ValueError(f"Circular dependency detected among: {remaining}")
-
-        # Build up to jobs nodes concurrently (or all if jobs is None)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
-            # If jobs is None, build all buildable nodes
-            nodes_to_process = (
-                buildable_nodes if jobs is None else buildable_nodes[:jobs]
+            if not buildable_nodes:
+                # If we can't build anything but still have nodes, we have a cycle
+                remaining = [n.key for n in nodes_to_build]
+                raise ValueError(f"Circular dependency detected among: {remaining}")
+            logger.info(
+                "ready to build: %s",
+                ", ".join(n.canonicalized_name for n in buildable_nodes),
             )
-            futures = []
-            for node in nodes_to_process:
-                req = Requirement(f"{node.canonicalized_name}=={node.version}")
-                futures.append(
-                    executor.submit(
-                        _build_parallel,
-                        wkctx,
-                        node.version,
-                        req,
-                        node.download_url,
-                    )
-                )
 
-            # Wait for all builds to complete
-            for node, future in zip(nodes_to_process, futures, strict=True):
-                try:
-                    wheel_filename = future.result()
-                    server.update_wheel_mirror(wkctx)
-                    # After we update the wheel mirror, the built file has
-                    # moved to a new directory.
-                    wheel_filename = wkctx.wheels_downloads / wheel_filename.name
-                    entries.append(
-                        BuildSequenceEntry(
-                            node.canonicalized_name,
+            # Build up to jobs nodes concurrently (or all if jobs is None)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = []
+                for node in buildable_nodes:
+                    req = Requirement(f"{node.canonicalized_name}=={node.version}")
+                    futures.append(
+                        executor.submit(
+                            _build_parallel,
+                            wkctx,
                             node.version,
-                            False,  # not prebuilt
+                            req,
                             node.download_url,
-                            wheel_filename=wheel_filename,
                         )
                     )
-                    built_nodes.add(node.key)
-                    nodes_to_build.remove(node)
-                except Exception as e:
-                    logger.error(f"Failed to build {node.key}: {e}")
-                    raise
+
+                # Wait for all builds to complete
+                for node, future in zip(buildable_nodes, futures, strict=True):
+                    try:
+                        wheel_filename = future.result()
+                        server.update_wheel_mirror(wkctx)
+                        # After we update the wheel mirror, the built file has
+                        # moved to a new directory.
+                        wheel_filename = wkctx.wheels_downloads / wheel_filename.name
+                        entries.append(
+                            BuildSequenceEntry(
+                                node.canonicalized_name,
+                                node.version,
+                                False,  # not prebuilt
+                                node.download_url,
+                                wheel_filename=wheel_filename,
+                            )
+                        )
+                        built_nodes.add(node.key)
+                        nodes_to_build.remove(node)
+                        progressbar.update()
+                    except Exception as e:
+                        logger.error(f"Failed to build {node.key}: {e}")
+                        raise
 
     metrics.summarize(wkctx, "Building in parallel")
     _summary(wkctx, entries)
