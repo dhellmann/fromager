@@ -82,7 +82,7 @@ if ! grep -q "skipping builds for versions of packages available" "$log"; then
   echo "Did not find message indicating builds would be skipped" 1>&2
   pass=false
 fi
-if ! grep -q "skipping building wheels for stevedore" "$log"; then
+if ! grep -q "skipping building wheel for stevedore" "$log"; then
   echo "Did not find message indicating build of stevedore was skipped" 1>&2
   pass=false
 fi
@@ -105,7 +105,7 @@ if ! grep -q "skipping builds for versions of packages available" "$log"; then
   echo "Did not find message indicating builds would be skipped" 1>&2
   pass=false
 fi
-if ! grep -q "skipping building wheels for stevedore" "$log"; then
+if ! grep -q "skipping building wheel for stevedore" "$log"; then
   echo "Did not find message indicating build of stevedore was skipped" 1>&2
   pass=false
 fi
