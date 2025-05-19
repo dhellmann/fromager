@@ -59,23 +59,28 @@ def run_wheel_server(
     return t
 
 
-def update_wheel_mirror(ctx: context.WorkContext) -> None:
-    for wheel in ctx.wheels_build.glob("*.whl"):
-        logger.info("adding %s to local wheel server", wheel.name)
-        downloads_dest_filename = ctx.wheels_downloads / wheel.name
-        # Always move the file so the code managing the timer for the
-        # wheels does not find more than one wheel in the build
-        # directory.
-        shutil.move(wheel, downloads_dest_filename)
+# Lock for thread-safe wheel mirror updates
+_wheel_mirror_lock = threading.Lock()
 
-    for wheel in ctx.wheels_downloads.glob("*.whl"):
-        # Now also symlink the files into the simple hierarchy. We always
-        # process all files to be safe.
-        (normalized_name, _, _, _) = parse_wheel_filename(wheel.name)
-        simple_dest_filename = ctx.wheel_server_dir / normalized_name / wheel.name
-        if simple_dest_filename.exists():
-            logger.debug("already have %s", simple_dest_filename)
-            continue
-        logger.debug("linking %s into local index", wheel.name)
-        simple_dest_filename.parent.mkdir(parents=True, exist_ok=True)
-        simple_dest_filename.symlink_to(wheel)
+
+def update_wheel_mirror(ctx: context.WorkContext) -> None:
+    with _wheel_mirror_lock:
+        for wheel in ctx.wheels_build.glob("*.whl"):
+            logger.info("adding %s to local wheel server", wheel.name)
+            downloads_dest_filename = ctx.wheels_downloads / wheel.name
+            # Always move the file so the code managing the timer for the
+            # wheels does not find more than one wheel in the build
+            # directory.
+            shutil.move(wheel, downloads_dest_filename)
+
+        for wheel in ctx.wheels_downloads.glob("*.whl"):
+            # Now also symlink the files into the simple hierarchy. We always
+            # process all files to be safe.
+            (normalized_name, _, _, _) = parse_wheel_filename(wheel.name)
+            simple_dest_filename = ctx.wheel_server_dir / normalized_name / wheel.name
+            if simple_dest_filename.exists():
+                logger.debug("already have %s", simple_dest_filename)
+                continue
+            logger.debug("linking %s into local index", wheel.name)
+            simple_dest_filename.parent.mkdir(parents=True, exist_ok=True)
+            simple_dest_filename.symlink_to(wheel)
