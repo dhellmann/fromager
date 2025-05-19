@@ -21,11 +21,13 @@ from fromager import (
     build_environment,
     clickext,
     context,
+    dependency_graph,
     hooks,
     metrics,
     overrides,
     progress,
     read,
+    requirements_file,
     server,
     sources,
     wheels,
@@ -454,3 +456,163 @@ def _is_wheel_built(
     except Exception:
         logger.info(f"could not locate prebuilt wheel. Will build {req}")
         return False, None
+
+
+@click.command()
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    default=False,
+    help="rebuild wheels even if they have already been built",
+)
+@click.option(
+    "-c",
+    "--cache-wheel-server-url",
+    "cache_wheel_server_url",
+    help="url to a wheel server from where fromager can check if it had already built the wheel",
+)
+@click.option(
+    "-j",
+    "--jobs",
+    type=int,
+    default=None,
+    help="number of parallel jobs to run (default: unlimited)",
+)
+@click.argument("graph_file")
+@click.pass_obj
+def build_parallel(
+    wkctx: context.WorkContext,
+    graph_file: str,
+    force: bool,
+    cache_wheel_server_url: str | None,
+    jobs: int | None,
+) -> None:
+    """Build wheels in parallel based on a dependency graph
+
+    GRAPH_FILE is a graph.json file containing the dependency relationships between packages
+
+    Performs parallel builds of wheels based on their dependency relationships.
+    Packages that have no dependencies or whose dependencies are already built
+    can be built concurrently. By default, all possible packages are built in
+    parallel. Use --jobs to limit the number of concurrent builds.
+
+    """
+    server.start_wheel_server(wkctx)
+    wheel_server_urls = [wkctx.wheel_server_url]
+    if cache_wheel_server_url:
+        # put after local server so we always check local server first
+        wheel_server_urls.append(cache_wheel_server_url)
+
+    if force:
+        logger.info(f"rebuilding all wheels even if they exist in {wheel_server_urls}")
+    else:
+        logger.info(
+            f"skipping builds for versions of packages available at {wheel_server_urls}"
+        )
+
+    # Load the dependency graph
+    logger.info("reading dependency graph from %s", graph_file)
+    graph = dependency_graph.DependencyGraph.from_file(graph_file)
+
+    # Get all nodes that need to be built (excluding prebuilt ones and the root node)
+    nodes_to_build = []
+    for node in graph.nodes.values():
+        # Skip the root node and prebuilt nodes
+        if node.key == dependency_graph.ROOT or node.pre_built:
+            continue
+        if not force:
+            is_built, wheel_filename = _is_wheel_built(
+                wkctx, node.canonicalized_name, node.version, wheel_server_urls
+            )
+            if is_built:
+                logger.info(
+                    "%s: skipping building wheel for %s==%s since it already exists",
+                    node.canonicalized_name,
+                    node.canonicalized_name,
+                    node.version,
+                )
+                continue
+        nodes_to_build.append(node)
+
+    # Sort nodes by their dependencies to ensure we build in the right order
+    # A node can be built when all of its build dependencies are built
+    built_nodes = set()
+    entries: list[BuildSequenceEntry] = []
+
+    while nodes_to_build:
+        # Find nodes that can be built (all build dependencies are built)
+        buildable_nodes = []
+        for node in nodes_to_build:
+            # Get all build dependencies (build-system, build-backend, build-sdist)
+            build_deps = [
+                edge.destination_node
+                for edge in node.children
+                if edge.req_type
+                in {
+                    requirements_file.RequirementType.BUILD_SYSTEM,
+                    requirements_file.RequirementType.BUILD_BACKEND,
+                    requirements_file.RequirementType.BUILD_SDIST,
+                }
+            ]
+            # A node can be built when all of its build dependencies are built
+            if all(dep.key in built_nodes for dep in build_deps):
+                buildable_nodes.append(node)
+
+        if not buildable_nodes:
+            # If we can't build anything but still have nodes, we have a cycle
+            remaining = [n.key for n in nodes_to_build]
+            raise ValueError(f"Circular dependency detected among: {remaining}")
+
+        # Build up to jobs nodes concurrently (or all if jobs is None)
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            # If jobs is None, build all buildable nodes
+            nodes_to_process = (
+                buildable_nodes if jobs is None else buildable_nodes[:jobs]
+            )
+            futures = []
+            for node in nodes_to_process:
+                req = Requirement(f"{node.canonicalized_name}=={node.version}")
+                token = requirement_ctxvar.set(req)
+                futures.append(
+                    executor.submit(
+                        _build,
+                        wkctx,
+                        node.version,
+                        req,
+                        node.download_url,
+                    )
+                )
+                requirement_ctxvar.reset(token)
+
+            # Wait for all builds to complete
+            for node, future in zip(nodes_to_process, futures):
+                try:
+                    wheel_filename = future.result()
+                    server.update_wheel_mirror(wkctx)
+                    # After we update the wheel mirror, the built file has
+                    # moved to a new directory.
+                    wheel_filename = wkctx.wheels_downloads / wheel_filename.name
+                    entries.append(
+                        BuildSequenceEntry(
+                            node.canonicalized_name,
+                            node.version,
+                            False,  # not prebuilt
+                            node.download_url,
+                            wheel_filename=wheel_filename,
+                        )
+                    )
+                    built_nodes.add(node.key)
+                    nodes_to_build.remove(node)
+                    print(wheel_filename)
+                except Exception as e:
+                    logger.error(f"Failed to build {node.key}: {e}")
+                    raise
+
+    metrics.summarize(wkctx, "Building in parallel")
+    _summary(wkctx, entries)
+
+
+build_parallel._fromager_show_build_settings = True  # type: ignore
