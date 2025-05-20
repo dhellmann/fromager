@@ -28,7 +28,6 @@ from fromager import (
     overrides,
     progress,
     read,
-    requirements_file,
     server,
     sources,
     wheels,
@@ -562,12 +561,7 @@ def build_parallel(
             build_deps = [
                 edge.destination_node
                 for edge in node.children
-                if edge.req_type
-                in {
-                    requirements_file.RequirementType.BUILD_SYSTEM,
-                    requirements_file.RequirementType.BUILD_BACKEND,
-                    requirements_file.RequirementType.BUILD_SDIST,
-                }
+                if edge.req_type.is_build_requirement
             ]
             # A node can be built when all of its build dependencies are built
             if all(dep.key in built_nodes for dep in build_deps):
@@ -579,7 +573,6 @@ def build_parallel(
             raise ValueError(f"Circular dependency detected among: {remaining}")
 
         # Build up to jobs nodes concurrently (or all if jobs is None)
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
             # If jobs is None, build all buildable nodes
             nodes_to_process = (
