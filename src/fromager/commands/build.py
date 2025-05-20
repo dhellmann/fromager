@@ -459,6 +459,19 @@ def _is_wheel_built(
         return False, None
 
 
+def _build_parallel(
+    wkctx: context.WorkContext,
+    resolved_version: Version,
+    req: Requirement,
+    source_download_url: str,
+) -> pathlib.Path:
+    try:
+        token = requirement_ctxvar.set(req)
+        return _build(wkctx, resolved_version, req, source_download_url)
+    finally:
+        requirement_ctxvar.reset(token)
+
+
 @click.command()
 @click.option(
     "-f",
@@ -575,17 +588,15 @@ def build_parallel(
             futures = []
             for node in nodes_to_process:
                 req = Requirement(f"{node.canonicalized_name}=={node.version}")
-                token = requirement_ctxvar.set(req)
                 futures.append(
                     executor.submit(
-                        _build,
+                        _build_parallel,
                         wkctx,
                         node.version,
                         req,
                         node.download_url,
                     )
                 )
-                requirement_ctxvar.reset(token)
 
             # Wait for all builds to complete
             for node, future in zip(nodes_to_process, futures, strict=True):
