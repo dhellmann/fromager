@@ -217,6 +217,11 @@ def build_sequence(
                     dist_version=str(resolved_version),
                     wheel_filename=wheel_filename,
                 )
+                server.update_wheel_mirror(wkctx)
+                # After we update the wheel mirror, the built file has
+                # moved to a new directory.
+                wheel_filename = wkctx.wheels_downloads / wheel_filename.name
+
             else:
                 logger.info(
                     "%s: building %s==%s", dist_name, dist_name, resolved_version
@@ -225,10 +230,6 @@ def build_sequence(
                     wkctx, resolved_version, req, source_download_url
                 )
 
-            server.update_wheel_mirror(wkctx)
-            # After we update the wheel mirror, the built file has
-            # moved to a new directory.
-            wheel_filename = wkctx.wheels_downloads / wheel_filename.name
             entries.append(
                 BuildSequenceEntry(
                     dist_name,
@@ -415,6 +416,12 @@ def _build(
         wheel_filename=wheel_filename,
     )
 
+    server.update_wheel_mirror(wkctx)
+
+    # After we update the wheel mirror, the built file has
+    # moved to a new directory.
+    wheel_filename = wkctx.wheels_downloads / wheel_filename.name
+
     return wheel_filename
 
 
@@ -511,6 +518,8 @@ def build_parallel(
     parallel. Use --jobs to limit the number of concurrent builds.
 
     """
+    wkctx.enable_parallel_builds()
+
     server.start_wheel_server(wkctx)
     wheel_server_urls = [wkctx.wheel_server_url]
     if cache_wheel_server_url:
@@ -597,10 +606,6 @@ def build_parallel(
                 for node, future in zip(buildable_nodes, futures, strict=True):
                     try:
                         wheel_filename = future.result()
-                        server.update_wheel_mirror(wkctx)
-                        # After we update the wheel mirror, the built file has
-                        # moved to a new directory.
-                        wheel_filename = wkctx.wheels_downloads / wheel_filename.name
                         entries.append(
                             BuildSequenceEntry(
                                 node.canonicalized_name,

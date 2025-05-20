@@ -2,6 +2,7 @@ import collections
 import logging
 import os
 import pathlib
+import threading
 from urllib.parse import urlparse
 
 from packaging.requirements import Requirement
@@ -52,7 +53,7 @@ class WorkContext:
         self.sdists_downloads = self.sdists_repo / "downloads"
         self.sdists_builds = self.sdists_repo / "builds"
         self.wheels_repo = pathlib.Path(wheels_repo).absolute()
-        self.wheels_build = self.wheels_repo / "build"
+        self.wheels_build_base = self.wheels_repo / "build"
         self.wheels_downloads = self.wheels_repo / "downloads"
         self.wheels_prebuilt = self.wheels_repo / "prebuilt"
         self.wheel_server_dir = self.wheels_repo / "simple"
@@ -73,6 +74,25 @@ class WorkContext:
             dict[str, float]
         )
         self.time_description_store: dict[str, str] = {}
+
+        self._parallel_builds = False
+
+    def enable_parallel_builds(self) -> None:
+        self._parallel_builds = True
+
+    def disable_parallel_builds(self) -> None:
+        self._parallel_builds = False
+
+    @property
+    def wheels_build(self) -> pathlib.Path:
+        # when parallel builds are enabled, return a path that is unique for the
+        # current thread to avoid collisions when creating output files
+        if self._parallel_builds:
+            thread_path = self.wheels_build_base / f"{threading.get_native_id()}"
+            thread_path.mkdir(parents=True, exist_ok=True)
+            return thread_path
+        else:
+            return self.wheels_build_base
 
     @property
     def pip_wheel_server_args(self) -> list[str]:

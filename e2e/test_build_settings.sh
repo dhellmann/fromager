@@ -39,7 +39,7 @@ fromager \
     build "${DIST}" "${VERSION}" "unreachable_url"
 
 EXPECTED_FILES="
-wheels-repo/build/stevedore-5.2.0-0-py3-none-any.whl
+wheels-repo/downloads/stevedore-5.2.0-0-py3-none-any.whl
 sdists-repo/downloads/stevedore-custom-5.2.0.tar.gz
 sdists-repo/builds/stevedore-5.2.0.tar.gz
 sdists-repo/builds/test-output-file.txt
