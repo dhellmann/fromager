@@ -493,11 +493,11 @@ def _build_parallel(
     help="url to a wheel server from where fromager can check if it had already built the wheel",
 )
 @click.option(
-    "-j",
-    "--jobs",
+    "-m",
+    "--max-workers",
     type=int,
     default=None,
-    help="number of parallel jobs to run (default: unlimited)",
+    help="maximum number of parallel workers to run (default: unlimited)",
 )
 @click.argument("graph_file")
 @click.pass_obj
@@ -506,7 +506,7 @@ def build_parallel(
     graph_file: str,
     force: bool,
     cache_wheel_server_url: str | None,
-    jobs: int | None,
+    max_workers: int | None,
 ) -> None:
     """Build wheels in parallel based on a dependency graph
 
@@ -515,7 +515,7 @@ def build_parallel(
     Performs parallel builds of wheels based on their dependency relationships.
     Packages that have no dependencies or whose dependencies are already built
     can be built concurrently. By default, all possible packages are built in
-    parallel. Use --jobs to limit the number of concurrent builds.
+    parallel. Use --max-workers to limit the number of concurrent builds.
 
     """
     wkctx.enable_parallel_builds()
@@ -587,8 +587,10 @@ def build_parallel(
                 ", ".join(n.canonicalized_name for n in buildable_nodes),
             )
 
-            # Build up to jobs nodes concurrently (or all if jobs is None)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            # Build up to max_workers nodes concurrently (or all if max_workers is None)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
                 futures = []
                 for node in buildable_nodes:
                     req = Requirement(f"{node.canonicalized_name}=={node.version}")
