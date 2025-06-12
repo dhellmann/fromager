@@ -80,9 +80,6 @@ class WorkContext:
     def enable_parallel_builds(self) -> None:
         self._parallel_builds = True
 
-    def disable_parallel_builds(self) -> None:
-        self._parallel_builds = False
-
     @property
     def wheels_build(self) -> pathlib.Path:
         # when parallel builds are enabled, return a path that is unique for the
