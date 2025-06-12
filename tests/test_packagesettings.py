@@ -81,6 +81,7 @@ FULL_EXPECTED: dict[str, typing.Any] = {
             "pre_built": False,
         },
     },
+    "exclusive_build": False,
 }
 
 EMPTY_EXPECTED: dict[str, typing.Any] = {
@@ -110,6 +111,7 @@ EMPTY_EXPECTED: dict[str, typing.Any] = {
         "include_wheels": False,
     },
     "variants": {},
+    "exclusive_build": False,
 }
 
 

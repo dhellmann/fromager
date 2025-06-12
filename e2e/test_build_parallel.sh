@@ -15,25 +15,33 @@ VERSION="1.14.0"
 #     --sdists-repo="$OUTDIR/sdists-repo" \
 #     --wheels-repo="$OUTDIR/wheels-repo" \
 #     --work-dir="$OUTDIR/work-dir" \
-#     --settings-dir="$SCRIPTDIR/changelog_settings" \
+#     --settings-dir="$SCRIPTDIR/build-parallel" \
 #     bootstrap "${DIST}==${VERSION}"
 
 # Save the build order file but remove everything else.
 # cp "$OUTDIR/work-dir/graph.json" "$OUTDIR/"
 
 # Copy the cached graph file to the working directory
-cp "$SCRIPTDIR/build-parallel-graph.json" "$OUTDIR/graph.json"
+cp "$SCRIPTDIR/build-parallel/graph.json" "$OUTDIR/graph.json"
 
 # Build everything a first time
 log="$OUTDIR/build-logs/${DIST}-build.log"
 fromager \
-    --debug \
     --log-file "$log" \
     --work-dir "$OUTDIR/work-dir" \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
-    --settings-dir="$SCRIPTDIR/changelog_settings" \
+    --settings-dir="$SCRIPTDIR/build-parallel" \
     build-parallel "$OUTDIR/graph.json"
+
+if ! grep -q "ready to build cython" "$log"; then
+  echo "Did not find message indicating build of cython would start" 1>&2
+  pass=false
+fi
+if ! grep -q "cython: requires exclusive build" "$log"; then
+  echo "Did not find message indicating build of cython would run on its own" 1>&2
+  pass=false
+fi
 
 # Rebuild everything even if it already exists
 log="$OUTDIR/build-logs/${DIST}-build.log"
@@ -42,7 +50,7 @@ fromager \
     --work-dir "$OUTDIR/work-dir" \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
-    --settings-dir="$SCRIPTDIR/changelog_settings" \
+    --settings-dir="$SCRIPTDIR/build-parallel" \
     build-parallel --force "$OUTDIR/graph.json"
 
 find "$OUTDIR/wheels-repo/"
@@ -84,7 +92,7 @@ fromager \
     --work-dir "$OUTDIR/work-dir" \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
-    --settings-dir="$SCRIPTDIR/changelog_settings" \
+    --settings-dir="$SCRIPTDIR/build-parallel" \
     build-parallel "$OUTDIR/graph.json"
 
 find "$OUTDIR/wheels-repo/"

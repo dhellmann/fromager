@@ -587,6 +587,21 @@ def build_parallel(
                 ", ".join(n.canonicalized_name for n in buildable_nodes),
             )
 
+            # Check if any buildable node requires exclusive build (exclusive_build == True)
+            exclusive_nodes = [
+                node
+                for node in buildable_nodes
+                if wkctx.settings.package_build_info(
+                    node.canonicalized_name
+                ).exclusive_build
+            ]
+            if exclusive_nodes:
+                # Only build the first exclusive node this round
+                buildable_nodes = [exclusive_nodes[0]]
+                logger.info(
+                    f"{exclusive_nodes[0].canonicalized_name}: requires exclusive build, running it alone this round."
+                )
+
             # Build up to max_workers nodes concurrently (or all if max_workers is None)
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers
