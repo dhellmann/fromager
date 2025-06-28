@@ -326,6 +326,31 @@ def test_write_constraints_file_multiples():
     assert expected == buffer.getvalue()
 
 
+def test_detect_incompatible_dependencies(testdata_path: pathlib.Path):
+    """Test that incompatible dependencies are detected.
+
+    $ fromager graph why ~/Downloads/release/outputs/graph.json accelerate
+
+    accelerate==1.8.1
+    * is an install dependency of trl==0.14.0 with req accelerate>=0.34.0
+    * is an install dependency of peft==0.15.2 with req accelerate>=0.21.0
+    * is an install dependency of trl==0.19.0 with req accelerate>=1.4.0
+    * is an install dependency of instructlab-eval==0.5.1 with req accelerate
+    * is an install dependency of lm-eval==0.4.9 with req accelerate>=0.26.0
+
+    accelerate==1.0.1
+    * is an install dependency of instructlab-training==0.11 with req accelerate<1.1.0,>=0.34.2; extra == "cuda"
+    """
+    graph_path = testdata_path / "incompatible-dependencies-graph.json"
+    graph = dependency_graph.DependencyGraph.from_file(graph_path)
+    buffer = io.StringIO()
+    assert not bootstrap.write_constraints_file(graph, buffer)
+    assert (
+        "ERROR: no single version of accelerate met all requirements"
+        in buffer.getvalue()
+    )
+
+
 def test_skip_constraints_cli_option():
     """Test that the --skip-constraints option is available in the CLI"""
     runner = CliRunner()

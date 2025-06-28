@@ -45,6 +45,9 @@ class DependencyNode:
         self.download_url = download_url
         self.pre_built = pre_built
 
+    def __repr__(self) -> str:
+        return f"{self.canonicalized_name}=={self.version}"
+
     def add_child(
         self,
         child: "DependencyNode",
@@ -112,6 +115,9 @@ class DependencyEdge:
             "req_type": str(self.req_type),
             "req": str(self.req),
         }
+
+    def __repr__(self) -> str:
+        return f"{self.destination_node} ({self.req})"
 
 
 class DependencyGraph:
