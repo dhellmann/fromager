@@ -541,6 +541,9 @@ def build_parallel(
     graph: dependency_graph.DependencyGraph
     graph = dependency_graph.DependencyGraph.from_file(graph_file)
 
+    # Track what has been built
+    built_node_keys: set[str] = set()
+
     # Get all nodes that need to be built (excluding prebuilt ones and the root node)
     nodes_to_build: DependencyNodeList = []
     for node in graph.nodes.values():
@@ -558,8 +561,10 @@ def build_parallel(
                     node.canonicalized_name,
                     node.version,
                 )
+                built_node_keys.add(node.key)
                 continue
         nodes_to_build.append(node)
+    logger.info("found %d packages already built", len(built_node_keys))
     logger.info("found %d packages to build", len(nodes_to_build))
 
     # Sort the nodes to build by their canonicalized name one time to avoid
@@ -568,7 +573,6 @@ def build_parallel(
 
     # Sort nodes by their dependencies to ensure we build in the right order
     # A node can be built when all of its build dependencies are built
-    built_node_keys: set[str] = set()
     entries: list[BuildSequenceEntry] = []
 
     with progress.progress_context(total=len(nodes_to_build)) as progressbar:

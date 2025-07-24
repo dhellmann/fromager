@@ -43,15 +43,40 @@ if ! grep -q "cython: requires exclusive build" "$log"; then
   pass=false
 fi
 
-# Rebuild everything even if it already exists
-log="$OUTDIR/build-logs/${DIST}-build.log"
-fromager \
+# Verify that if some of the files exist locally they are treated as already
+# built by deleting some indirect dependencies and trying again, keeping
+# setuptools and platlib wheels that are expensive to build.
+find "$OUTDIR/wheels-repo/" -name '*py3-none-any.whl' -and -not -name 'setuptools*.whl' -delete
+
+log="$OUTDIR/build-logs/${DIST}-build-only-some.log"
+if ! fromager \
     --log-file "$log" \
     --work-dir "$OUTDIR/work-dir" \
     --sdists-repo "$OUTDIR/sdists-repo" \
     --wheels-repo "$OUTDIR/wheels-repo" \
     --settings-dir="$SCRIPTDIR/build-parallel" \
-    build-parallel --force "$OUTDIR/graph.json"
+    build-parallel "$OUTDIR/graph.json"; then
+  echo "Failed to build when some files exist locally" 1>&2
+  pass=false
+fi
+
+if grep -q "skipping building wheel for setuptools" "$log"; then
+  echo "Found message indicating build of setuptools was skipped" 1>&2
+  pass=false
+fi
+
+# Rebuild everything even if it already exists
+log="$OUTDIR/build-logs/${DIST}-rebuild-all.log"
+if !fromager \
+    --log-file "$log" \
+    --work-dir "$OUTDIR/work-dir" \
+    --sdists-repo "$OUTDIR/sdists-repo" \
+    --wheels-repo "$OUTDIR/wheels-repo" \
+    --settings-dir="$SCRIPTDIR/build-parallel" \
+    build-parallel --force "$OUTDIR/graph.json"; then
+  echo "Failed to rebuild all" 1>&2
+  pass=false
+fi
 
 find "$OUTDIR/wheels-repo/"
 
@@ -109,7 +134,7 @@ fi
 $pass
 
 # Rebuild everything while reusing wheels from external server
-rm -rf $OUTDIR/wheels-repo
+rm -rf "$OUTDIR"/wheels-repo
 log="$OUTDIR/build-logs/${DIST}-build-skip-env.log"
 fromager \
     --log-file "$log" \
