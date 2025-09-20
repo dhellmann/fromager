@@ -135,6 +135,81 @@ def test_provider_cache():
         assert str(candidate.version) == "1.3.2"
 
 
+def test_provider_cache_capped_requirement():
+    with requests_mock.Mocker() as r:
+        r.get(
+            "https://pypi.org/simple/hydra-core/",
+            text=_hydra_core_simple_response,
+        )
+
+        # fill the cache
+        provider = resolver.PyPIProvider(include_sdists=False)
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core<1.2.4")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.2.2"
+        assert "hydra-core" in resolver.PyPIProvider.pypi_resolver_cache
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 1
+
+        # resolve for build requirement should end up with the already seen older version
+        provider = resolver.PyPIProvider(
+            include_sdists=False, req_type=RequirementType.BUILD_SDIST
+        )
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core>=1.2")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.2.2"
+        assert "hydra-core" in resolver.PyPIProvider.pypi_resolver_cache
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 1
+
+        # resolve for build requirement should end up with the already seen older version
+        provider = resolver.PyPIProvider(
+            include_sdists=False, req_type=RequirementType.BUILD_SDIST
+        )
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.2.2"
+        assert "hydra-core" in resolver.PyPIProvider.pypi_resolver_cache
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 1
+
+        # resolve for install requirement should ignore the already seen older version
+        provider = resolver.PyPIProvider(
+            include_sdists=False, req_type=RequirementType.INSTALL
+        )
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core>=1.2")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.3.2"
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 5
+
+        # double check previous rule resolves the same way
+        provider = resolver.PyPIProvider(
+            include_sdists=False, req_type=RequirementType.BUILD_SDIST
+        )
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core>=1.2")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.2.2"
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 1
+
+        # if resolving for build but with different conditions, don't use cache
+        provider = resolver.PyPIProvider(
+            include_wheels=False, req_type=RequirementType.BUILD_SDIST
+        )
+        reporter = resolvelib.BaseReporter()
+        rslvr = resolvelib.Resolver(provider, reporter)
+        result = rslvr.resolve([Requirement("hydra-core>=1.2")])
+        candidate = result.mapping["hydra-core"]
+        assert str(candidate.version) == "1.3.2"
+        assert len(resolver.PyPIProvider.pypi_resolver_cache["hydra-core"]) == 1
+
+
 def test_provider_choose_wheel_prereleases():
     with requests_mock.Mocker() as r:
         r.get(

@@ -405,6 +405,8 @@ class BaseProvider(ExtrasProvider):
         # we can't guarantee that the latest version is available in the cache so install time reqs cannot use the cache
         if self.req_type is None or not self.req_type.is_build_requirement:
             return []
+        if identifier in cache:
+            logger.debug("using previously discovered versions in the cache")
         return [
             c
             for c in cache[identifier]
@@ -414,6 +416,7 @@ class BaseProvider(ExtrasProvider):
     def add_to_cache(self, identifier: str, candidates: list[Candidate]) -> None:
         # we can add candidates to cache even for install type reqs because build time reqs are
         # allowed to use candidates seen when we were resolving the same req as an install type
+        logging.debug("updating cache for %s with %s", identifier, candidates)
         self.get_cache()[identifier].extend(candidates)
 
     def get_preference(
