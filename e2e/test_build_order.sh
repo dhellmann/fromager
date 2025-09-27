@@ -10,6 +10,8 @@ source "$SCRIPTDIR/common.sh"
 DIST="stevedore"
 VERSION="5.2.0"
 
+BUILD_SUMMARY_FILE="$OUTDIR/work-dir/build-sequence-summary.json"
+
 # Bootstrap the test project
 fromager \
     --debug \
@@ -18,6 +20,15 @@ fromager \
     --work-dir="$OUTDIR/work-dir" \
     --settings-dir="$SCRIPTDIR/changelog_settings" \
     bootstrap "${DIST}==${VERSION}"
+
+# Verify that build-sequence-summary.json reports that stevedore was built.
+if [ -f "$BUILD_SUMMARY_FILE" ]; then
+  skipped=$(jq '.[] | select(.name=="stevedore") | .skipped' "$BUILD_SUMMARY_FILE")
+  if [ "$skipped" != "false" ]; then
+    echo "FAIL: build-sequence-summary.json has incorrect skipped status $skipped for stevedore, should be false" 1>&2
+    pass=false
+  fi
+fi
 
 # Save the build order file but remove everything else.
 cp "$OUTDIR/work-dir/build-order.json" "$OUTDIR/"
@@ -39,7 +50,6 @@ if grep -q "skipping building wheel for stevedore" "$log"; then
   echo "Found message indicating build of stevedore was skipped" 1>&2
   pass=false
 fi
-
 
 EXPECTED_FILES="
 $OUTDIR/wheels-repo/downloads/setuptools-*.whl
@@ -105,6 +115,15 @@ fi
 if ! grep -q "${DIST}-${VERSION}: using existing wheel" "$log"; then
   echo "Did not find message indicating build of stevedore was skipped" 1>&2
   pass=false
+fi
+
+# Verify that build-sequence-summary.json reports that stevedore was not built.
+if [ -f "$BUILD_SUMMARY_FILE" ]; then
+  skipped=$(jq '.[] | select(.name=="stevedore") | .skipped' "$BUILD_SUMMARY_FILE")
+  if [ "$skipped" != "true" ]; then
+    echo "FAIL: build-sequence-summary.json has incorrect skipped status $skipped for stevedore, should be true" 1>&2
+    pass=false
+  fi
 fi
 
 $pass
