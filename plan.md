@@ -123,10 +123,11 @@ Implement phase handlers that process one phase and advance to the next:
 - `_phase_graph_update()`: Add to graph → advance to SEEN_CHECK
 - `_phase_seen_check()`: Check if seen → if new, mark seen and advance to BUILD; if seen, stop
 - `_phase_build()`: Build package (including build deps) → advance to EXTRACT_DEPS
-- `_phase_extract_deps()`: Extract install deps → advance to BUILD_ORDER
+- `_phase_extract_deps()`: Extract install deps, call update_total() → advance to BUILD_ORDER
 - `_phase_build_order()`: Record in build-order.json → advance to PROCESS_INSTALL
 - `_phase_process_install()`: Push install deps to stack → advance to CLEANUP
-- `_phase_cleanup()`: Clean build dirs → done (don't push back)
+- `_phase_cleanup()`: Clean build dirs → advance to COMPLETE
+- `_phase_complete()`: Call progressbar.update() → done (don't push back)
 
 ### 5. Build Dependencies Handling
 
@@ -162,89 +163,125 @@ The LIFO stack ensures depth-first processing: each install dep and its transiti
 **Current behavior** (lines 516, 522, 702, 709):
 
 - `update_total()` increases total count when dependencies are discovered
-- `update()` increments progress after EACH direct dependency completes (including all its transitive deps)
+- `update()` increments progress after EACH package completes (including building the package and processing all its transitive deps)
 
 **Challenge**: In recursive code, `update()` is called when a child's recursive call returns. In iterative code, we don't have a return point—we just push work items to the stack.
 
-**Solution**: Use progress update marker work items
+**Solution**: Use COMPLETE phase
 
-Add a simple marker class:
+The COMPLETE phase is the final phase for each work item. It:
 
-```python
-@dataclasses.dataclass
-class ProgressUpdateMarker:
-    """Marker work item that updates progress bar when popped from stack."""
-    pass
-```
+1. Calls `self.progressbar.update()` to increment progress
+2. Doesn't push the item back (processing complete)
 
-When pushing dependencies to the stack, insert markers **before** the dependency work items (so they pop **after** the deps complete):
+**Phase flow:**
 
-```python
-def _phase_process_install_deps(self, item, stack):
-    if item.install_dep_index < len(item.install_dependencies):
-        # Push current item back for next install dep
-        next_item = dataclasses.replace(item, install_dep_index=item.install_dep_index + 1)
-        stack.append(next_item)
+- GRAPH_UPDATE → SEEN_CHECK → BUILD → EXTRACT_DEPS → BUILD_ORDER → PROCESS_INSTALL → CLEANUP → **COMPLETE**
+- COMPLETE phase calls `update()` and finishes
 
-        # Push progress marker FIRST (pops LAST, after dep completes)
-        stack.append(ProgressUpdateMarker())
+**Update totals:**
 
-        # Push install dependency work items
-        dep = item.install_dependencies[item.install_dep_index]
-        dep_versions = self.resolve_versions(...)
-        for source_url, version in reversed(dep_versions):
-            stack.append(BootstrapWorkItem(...))
-```
+- Call `update_total(len(install_dependencies))` in EXTRACT_DEPS phase when install deps are discovered
+- Call `update_total(len(build_dependencies))` in BUILD phase when build deps are discovered
 
-In the main loop, detect markers and call `update()`:
+**Result**: Progress bar behaves identically to recursive version—updates after each package completes (including all its work and transitive dependencies).
+
+### 8. Error Handling Preservation
+
+All error handling modes work identically, but the mechanism changes from call-stack-based to work-stack-based.
+
+#### Main Loop Error Handling
 
 ```python
 while work_stack:
     item = work_stack.pop()
 
-    if isinstance(item, ProgressUpdateMarker):
-        self.progressbar.update()
-        continue
+    # Restore parent context
+    self.why = item.why_snapshot.copy()
 
-    # ... rest of processing
+    # Push current item for this phase
+    self.why.append((item.req_type, item.req, item.resolved_version))
+
+    try:
+        self._process_phase(item, work_stack)
+    except Exception as err:
+        # Pop current item from self.why
+        self.why.pop()
+
+        # Handle based on mode
+        if self.test_mode:
+            self._record_test_mode_failure(item.req, str(item.resolved_version), err, "bootstrap")
+            continue  # Skip to next work item
+
+        if self.multiple_versions:
+            pkg_name = canonicalize_name(item.req.name)
+            self._failed_versions.append((pkg_name, str(item.resolved_version), err))
+            self.ctx.dependency_graph.remove_dependency(pkg_name, item.resolved_version)
+            self.ctx.write_to_graph_to_file()
+            continue  # Skip to next work item (next version)
+
+        raise  # Fail-fast in normal mode
+    else:
+        # Success - pop current item from self.why
+        self.why.pop()
 ```
 
-**Processing order** (LIFO):
+**Test mode**: Catch exceptions per work item, record failure, continue to next item
 
-1. Pop and process install dep work item → entire dependency subtree completes
-2. Pop ProgressUpdateMarker → call `update()` ✓
-3. Pop parent item → continue to next install dep
-
-Same approach for build dependencies in `_prepare_build_dependencies_iterative()`.
-
-**Result**: Progress bar behaves identically to recursive version—updates after each direct dependency (and its transitive deps) completes.
-
-### 8. Error Handling Preservation
-
-All error handling modes work identically:
-
-**Test mode**: Catch exceptions per work item, record failure, don't push back (skip package)
-
-**Multiple versions mode**: Catch exceptions per version, record failure, remove from graph, don't push back (continue to other versions)
+**Multiple versions mode**: Catch exceptions per version, record failure, remove from graph, continue to next version
 
 **Normal mode**: Raise exceptions immediately (fail-fast)
 
-Non-fatal errors (hooks, dependency extraction) are caught within phase handlers, exactly as in current code.
+#### Phase Handler Error Handling
+
+Non-fatal errors (hooks, dependency extraction) are caught within phase handlers:
+
+```python
+def _phase_extract_deps(self, item, work_stack):
+    try:
+        install_dependencies = self._get_install_dependencies(...)
+    except Exception as dep_error:
+        if not self.test_mode:
+            raise
+        self._record_test_mode_failure(
+            item.req, str(item.resolved_version), dep_error,
+            "dependency_extraction", "warning"
+        )
+        install_dependencies = []
+
+    item.install_dependencies = install_dependencies
+    item.phase = BootstrapPhase.BUILD_ORDER
+    work_stack.append(item)
+```
+
+#### Failed Dependency Handling - Lazy Cleanup
+
+When a package fails, its dependencies may already be on the work stack. Use **lazy cleanup**:
+
+- Let dependency work items process normally
+- They will hit the `_seen_requirements` check and skip (already processed)
+- Or their build will fail naturally (missing dependencies in build environment)
+- This preserves exact recursive behavior without complex stack manipulation
+
+**Advantages:**
+
+- Simple - no need to scan/modify work_stack
+- Correct - `_seen_requirements` already prevents reprocessing
+- Matches recursive behavior - failed package's deps would have failed anyway
 
 ## Critical Files to Modify
 
 **Primary file:**
 
 - `src/fromager/bootstrapper.py` (lines 270-526)
-  - Add `BootstrapWorkItem` dataclass, `ProgressUpdateMarker` dataclass, and `BootstrapPhase` enum
+  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum
   - Replace `bootstrap()` method with iterative version
   - Replace `_bootstrap_single_version()` (lines 322-390) - logic moves to work item creation
   - Replace `_bootstrap_impl()` (lines 392-526) - logic splits into phase handlers
-  - Replace `_handle_build_requirements()` (lines 696-709) - logic moves to `_prepare_build_dependencies_iterative()`
-  - Add 7 new phase handler methods
+  - Replace `_handle_build_requirements()` (lines 696-709) - logic moves to build phase
+  - Add 8 new phase handler methods (including COMPLETE)
   - Add build dependency helpers
-  - Add centralized error handler
-  - Update main loop to handle progress markers
+  - Update main loop with error handling and self.why management
 
 **Reference files (read-only, for patterns):**
 
@@ -260,17 +297,14 @@ Non-fatal errors (hooks, dependency extraction) are caught within phase handlers
 
 ### Step 1: Add Data Structures (Low Risk)
 
-- Add `BootstrapPhase` enum
+- Add `BootstrapPhase` enum (8 phases including COMPLETE)
 - Add `BootstrapWorkItem` dataclass
-- Add `ProgressUpdateMarker` dataclass
 - No behavior changes, not called yet
 
 ### Step 2: Add Phase Handler Methods (Low Risk)
 
-- Implement all `_phase_*()` methods by extracting logic from `_bootstrap_impl()`
-- Implement `_build_package()` to orchestrate building with build deps
-- Implement `_prepare_build_dependencies_iterative()` to push build deps
-- Implement `_handle_bootstrap_error()` for centralized error handling
+- Implement all 8 `_phase_*()` methods by extracting logic from `_bootstrap_impl()`
+- Implement build dependency helpers
 - Not called yet, no behavior changes
 
 ### Step 3: Add Feature Flag (Low Risk)
@@ -302,12 +336,31 @@ Non-fatal errors (hooks, dependency extraction) are caught within phase handlers
 
 **Challenge**: `self.why` is a shared stack tracking the current dependency chain. The recursive version manages it via the call stack.
 
-**Solution**: Snapshot and restore approach
+**Solution**: Snapshot and restore approach with main loop push/pop
 
-1. Each work item captures `why_snapshot = self.why.copy()` at creation time
-2. When processing a work item, restore: `self.why = item.why_snapshot.copy()`
-3. For build phase, temporarily push current requirement onto `self.why` (for build dep context)
-4. After build completes, pop from `self.why`
+1. Each work item captures `why_snapshot = self.why.copy()` at creation time (preserves parent context)
+2. Main loop restores parent context: `self.why = item.why_snapshot.copy()`
+3. Main loop pushes current item: `self.why.append((item.req_type, item.req, item.resolved_version))`
+4. Main loop pops current item in try/except/else for error safety
+5. Phase handlers see current item on `self.why` during processing
+
+**Main loop handles push/pop:**
+
+```python
+# Restore parent context
+self.why = item.why_snapshot.copy()
+
+# Push current item
+self.why.append((item.req_type, item.req, item.resolved_version))
+
+try:
+    self._process_phase(item, work_stack)
+except Exception as err:
+    self.why.pop()  # Cleanup on error
+    # ... handle error
+else:
+    self.why.pop()  # Cleanup on success
+```
 
 This preserves exact behavior for:
 
@@ -329,6 +382,21 @@ This preserves exact behavior for:
 2. Compare `build-order.json` - must be identical
 3. Compare `dependency-graph.json` - must be identical
 4. Compare log output - order should match
+5. Compare failure reports in test mode
+6. Compare failed versions list in multiple-versions mode
+
+### Error Mode Testing
+
+1. **Normal mode:** Verify fail-fast still works (exception propagates immediately)
+2. **Test mode:**
+   - Verify prebuilt fallback works for build failures
+   - Verify non-fatal errors (hooks, deps) are recorded but continue
+   - Verify failure report JSON is written
+3. **Multiple versions mode:**
+   - Verify all matching versions are processed
+   - Verify failures are recorded per-version
+   - Verify failed nodes are removed from graph
+   - Verify other versions continue after one fails
 
 ### Stress Testing
 
@@ -350,8 +418,9 @@ This preserves exact behavior for:
 3. **Test mode fallback**: Build failures trigger prebuilt fallback within `_build_package()`
 4. **Git URL requirements**: Resolution unchanged, happens before work item creation
 5. **Deep chains**: Work stack on heap, no recursion limit
-6. **Progress bar**: Uses marker work items to update after each dependency completes, matching recursive behavior exactly
+6. **Progress bar**: Uses COMPLETE phase to update after each package completes, matching recursive behavior exactly
 7. **Build/install dep ordering**: LIFO stack with correct push order ensures correct processing order
+8. **Self.why management**: Main loop handles push/pop with error safety, preserves dependency chain tracking
 
 ## Rollback Plan
 
