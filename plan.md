@@ -29,13 +29,13 @@ This refined plan clarifies several critical details:
 
 01. **5 phases total**: Optimized from 9 to 5 by combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE, CLEANUP+COMPLETE→COMPLETE) and eliminating unnecessary PROCESS_INSTALL phase (stack handles depth-first automatically)
 02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
-03. **Linear progression with early exit**: START acts as filter - already-seen packages return `[]` and stop flowing (no skip_processing flag needed)
+03. **Linear progression with early exit**: START acts as filter - already-seen packages return `[]` and stop flowing; main loop updates progress bar when it sees `[]` (no skip_processing flag needed)
 04. **Functional phase handlers**: Phase handlers return lists of work items instead of modifying the stack directly; main loop extends stack with returned items
 05. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
 06. **Phase handler details**: Explicit function signatures, behavior, and return values
 07. **Seen requirements**: Detailed key format and marking logic
 08. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
-09. **Progress bar correctness**: Only new packages reach COMPLETE; duplicates stop at START, matching recursive behavior
+09. **Progress bar correctness**: Main loop calls `update()` when phase returns `[]` (work done); handles both already-seen (START→`[]`) and fully-processed (COMPLETE→`[]`)
 10. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
 11. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
 12. **Memory usage note**: Linear with dependency width due to why_snapshot copies
@@ -128,10 +128,20 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
             # Process current phase - returns items to add to stack
             new_items = self._process_phase(item)
             work_stack.extend(new_items)
+
+            # Update progress bar when work item completes (returns [])
+            # This handles both already-seen (START returns []) and
+            # finished processing (COMPLETE returns [])
+            if not new_items:
+                self.progressbar.update()
         except Exception as err:
             # Handle error - may return items to continue processing
             new_items = self._handle_bootstrap_error(item, err)
             work_stack.extend(new_items)
+
+            # Update progress if error terminates this work item
+            if not new_items:
+                self.progressbar.update()
         finally:
             self.why.pop()
 ```
@@ -167,6 +177,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
     - Check seen key: `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
   - **If already seen:**
     - Return `[]` ← **Early exit! Item stops here, doesn't flow through remaining phases**
+    - Main loop sees `[]` and calls `progressbar.update()` (work item done)
   - **If not seen:**
     - Mark as seen in `self._seen_requirements`
     - Advance to EXTRACT_BUILD_DEPS
@@ -209,9 +220,10 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
   - **Work:**
     - Call cleanup hooks/methods
-    - Call `self.progressbar.update()` to increment progress
+    - Clean build directories
   - **Next:** Done
   - **Return:** `[]` ← **End of pipeline! Don't add back to stack**
+  - Main loop sees `[]` and calls `progressbar.update()` (work item done)
 
 ### 5. Build Dependencies Handling
 
@@ -325,22 +337,44 @@ The LIFO stack ensures depth-first processing: each install dep (all its version
 
 **Challenge**: In recursive code, `update()` is called when a child's recursive call returns. In iterative code, we don't have a return point—we just return work items from phases.
 
-**Solution**: Use COMPLETE phase
+**Critical bug to avoid**: If phases call `update()`, already-seen packages get counted in `update_total()` but never reach the phase that calls `update()`, causing progress to get stuck.
 
-The COMPLETE phase is the final phase for each work item. It:
+**Solution**: Main loop calls `update()` when work item completes
 
-1. Calls `self.progressbar.update()` to increment progress
-2. Returns `[]` (empty list, so item is not added back to stack)
+The main loop is the only place that knows when a work item is done (phase returns `[]`):
 
-**Phase flow:**
+```python
+new_items = self._process_phase(item)
+work_stack.extend(new_items)
 
-- START → EXTRACT_BUILD_DEPS → BUILD_PACKAGE → EXTRACT_INSTALL_DEPS → **COMPLETE**
-- COMPLETE phase cleans up and calls `update()`, then finishes
+# Update progress when work item completes (returns [])
+if not new_items:
+    self.progressbar.update()
+```
 
-**Update totals:**
+**Two completion scenarios:**
+
+1. **Already seen**: START returns `[]` → main loop calls `update()` → done
+2. **Fully processed**: COMPLETE returns `[]` → main loop calls `update()` → done
+
+**Update totals (unchanged):**
 
 - Call `update_total(len(install_dependencies))` in EXTRACT_INSTALL_DEPS phase when install deps are discovered
-- Call `update_total(len(build_dependencies))` in BUILD phase when build deps are discovered
+- Call `update_total(len(build_dependencies))` in EXTRACT_BUILD_DEPS phase when build deps are discovered
+
+**Why this works:**
+
+Every work item created gets counted (via `update_total()`). Every work item eventually returns `[]` (either at START if already seen, or at COMPLETE if processed). Main loop calls `update()` for each `[]`, ensuring counts match.
+
+**Example:**
+
+```
+Parent extracts deps [A, B, C] → calls update_total(3) → total = 3
+A processes → COMPLETE returns [] → main loop calls update() → progress = 1
+B already seen → START returns [] → main loop calls update() → progress = 2
+C processes → COMPLETE returns [] → main loop calls update() → progress = 3
+Result: 100% complete ✓
+```
 
 **Result**: Progress bar behaves identically to recursive version—updates after each package completes (including all its work and transitive dependencies).
 
@@ -615,11 +649,12 @@ This preserves exact behavior for:
 ```
 Item: requests-2.31.0
 
-START:            Add edge to graph → not in _seen_requirements → mark as seen → advance to EXTRACT_BUILD_DEPS → return [item]
-EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
-BUILD_PACKAGE:    Build sdist and wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
+START:               Add edge to graph → not in _seen_requirements → mark as seen → advance to EXTRACT_BUILD_DEPS → return [item]
+EXTRACT_BUILD_DEPS:  Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
+BUILD_PACKAGE:       Build sdist and wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
 EXTRACT_INSTALL_DEPS: Extract install deps → create work items for all deps → advance to COMPLETE → return [item] + install_dep_items
-COMPLETE:         Clean build dirs → update progress bar → return [] → done
+COMPLETE:            Clean build dirs → return []
+Main loop:           Sees [] → calls progressbar.update() → done
 ```
 
 **Example 2: Already seen package (duplicate dependency)**
@@ -627,10 +662,11 @@ COMPLETE:         Clean build dirs → update progress bar → return [] → don
 ```
 Item: urllib3-2.0.0
 
-START:            Add edge to graph → found in _seen_requirements → return [] ← STOPS HERE!
+START:      Add edge to graph → found in _seen_requirements → return []
+Main loop:  Sees [] → calls progressbar.update() ← STOPS HERE!
 
 (Item removed from pipeline - doesn't flow through remaining phases)
-(No progress bar update for duplicates - matches recursive behavior)
+(Progress bar updated for duplicates - they were counted in update_total())
 ```
 
 **Example 3: sdist_only mode**
@@ -638,11 +674,12 @@ START:            Add edge to graph → found in _seen_requirements → return [
 ```
 Item: numpy-1.24.0, build_sdist_only=True
 
-START:            Add edge to graph → not in _seen_requirements → mark as seen (sdist only) → advance to EXTRACT_BUILD_DEPS → return [item]
-EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
-BUILD_PACKAGE:    build_sdist_only=True → build only sdist, skip wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
+START:               Add edge to graph → not in _seen_requirements → mark as seen (sdist only) → advance to EXTRACT_BUILD_DEPS → return [item]
+EXTRACT_BUILD_DEPS:  Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
+BUILD_PACKAGE:       build_sdist_only=True → build only sdist, skip wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
 EXTRACT_INSTALL_DEPS: Extract install deps from sdist → create work items for all deps → advance to COMPLETE → return [item] + install_dep_items
-COMPLETE:         Clean build dirs → update progress bar → return [] → done
+COMPLETE:            Clean build dirs → return []
+Main loop:           Sees [] → calls progressbar.update() → done
 ```
 
 ## Additional Implementation Details
@@ -734,7 +771,7 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 03. **Test mode fallback**: Build failures trigger prebuilt fallback within `_build_package()`
 04. **sdist_only mode**: BUILD_PACKAGE phase checks `item.build_sdist_only` flag and skips wheel build
 05. **Already seen packages**: START returns `[]`, stopping the item from flowing through remaining phases (early exit)
-06. **Progress bar correctness**: Only new packages reach COMPLETE and update progress bar; duplicates stop at SEEN_CHECK, matching recursive behavior
+06. **Progress bar correctness**: Main loop updates progress when work item completes (returns `[]`); handles both already-seen packages (counted but stop at START) and fully-processed packages (reach COMPLETE)
 07. **Git URL requirements**: Resolution unchanged, happens before work item creation
 08. **Deep chains**: Work stack on heap, no recursion limit
 09. **Build/install dep ordering**: LIFO stack with correct push order ensures correct processing order
