@@ -27,7 +27,7 @@ This approach:
 
 This refined plan clarifies several critical details:
 
-01. **6 phases total**: Optimized from 9 to 6 by combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE) and eliminating unnecessary PROCESS_INSTALL phase (stack handles depth-first automatically)
+01. **5 phases total**: Optimized from 9 to 5 by combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE, CLEANUP+COMPLETE→COMPLETE) and eliminating unnecessary PROCESS_INSTALL phase (stack handles depth-first automatically)
 02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
 03. **Linear progression with early exit**: START acts as filter - already-seen packages return `[]` and stop flowing (no skip_processing flag needed)
 04. **Functional phase handlers**: Phase handlers return lists of work items instead of modifying the stack directly; main loop extends stack with returned items
@@ -86,8 +86,7 @@ class BootstrapPhase(StrEnum):
     EXTRACT_BUILD_DEPS = "build_deps"     # Collect and push build dependencies
     BUILD_PACKAGE = "build_package"       # Build package and record in build-order.json
     EXTRACT_INSTALL_DEPS = "extract_deps" # Extract and push install dependencies
-    CLEANUP = "cleanup"                   # Clean build directories
-    COMPLETE = "complete"                 # Done
+    COMPLETE = "complete"                 # Clean up and update progress bar
 ```
 
 ### 3. Main Iterative Loop
@@ -203,18 +202,14 @@ Phase handlers modify `item` in place and return a list of work items to add to 
       - Resolve versions for that dependency
       - Create work items for dependency versions in reverse order
       - Stack handles depth-first processing automatically
-  - **Next:** Advance to CLEANUP
+  - **Next:** Advance to COMPLETE
   - **Return:** `[item] + dep_items` (all dependency work items at once)
 
-- **`_phase_cleanup()`**: Clean build directories
+- **`_phase_complete()`**: Clean up and mark package complete
 
-  - **Work:** Call cleanup hooks/methods
-  - **Next:** Advance to COMPLETE
-  - **Return:** `[item]`
-
-- **`_phase_complete()`**: Mark package complete
-
-  - **Work:** Call `self.progressbar.update()` to increment progress
+  - **Work:**
+    - Call cleanup hooks/methods
+    - Call `self.progressbar.update()` to increment progress
   - **Next:** Done
   - **Return:** `[]` ← **End of pipeline! Don't add back to stack**
 
@@ -242,9 +237,9 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
 **Stack ordering ensures correctness:**
 
-- LIFO stack pops SYSTEM first → processes through all 6 phases → completes
-- Then pops BACKEND → processes through all 6 phases → completes
-- Then pops SDIST → processes through all 6 phases → completes
+- LIFO stack pops SYSTEM first → processes through all 5 phases → completes
+- Then pops BACKEND → processes through all 5 phases → completes
+- Then pops SDIST → processes through all 5 phases → completes
 - Finally pops parent item in BUILD_PACKAGE phase → all build deps are ready
 
 **Example stack flow:**
@@ -252,9 +247,9 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 ```
 Initial: [parent@EXTRACT_BUILD_DEPS]
 After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@GRAPH_UPDATE, BACKEND@GRAPH_UPDATE, SYSTEM@GRAPH_UPDATE]
-Pop SYSTEM → flows through all 6 phases → completes
-Pop BACKEND → flows through all 6 phases → completes
-Pop SDIST → flows through all 6 phases → completes
+Pop SYSTEM → flows through all 5 phases → completes
+Pop BACKEND → flows through all 5 phases → completes
+Pop SDIST → flows through all 5 phases → completes
 Pop parent@BUILD_PACKAGE → build with all deps available → continues to EXTRACT_INSTALL_DEPS → ... → COMPLETE
 ```
 
@@ -339,8 +334,8 @@ The COMPLETE phase is the final phase for each work item. It:
 
 **Phase flow:**
 
-- START → EXTRACT_BUILD_DEPS → BUILD_PACKAGE → EXTRACT_INSTALL_DEPS → CLEANUP → **COMPLETE**
-- COMPLETE phase calls `update()` and finishes
+- START → EXTRACT_BUILD_DEPS → BUILD_PACKAGE → EXTRACT_INSTALL_DEPS → **COMPLETE**
+- COMPLETE phase cleans up and calls `update()`, then finishes
 
 **Update totals:**
 
@@ -434,7 +429,7 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 **Primary file:**
 
 - `src/fromager/bootstrapper.py` (lines 270-526)
-  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum (6 phases)
+  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum (5 phases)
   - Replace `bootstrap()` method with iterative version
   - Replace `_bootstrap_single_version()` (lines 322-390) - logic moves to work item creation
   - Replace `_bootstrap_impl()` (lines 392-526) - logic splits into phase handlers
@@ -468,7 +463,7 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 ### Step 1: Add Data Structures (Low Risk)
 
-- Add `BootstrapPhase` enum (6 phases including COMPLETE)
+- Add `BootstrapPhase` enum (5 phases including COMPLETE)
 - Add `BootstrapWorkItem` dataclass
 - No behavior changes, not called yet
 
@@ -623,9 +618,8 @@ Item: requests-2.31.0
 START:            Add edge to graph → not in _seen_requirements → mark as seen → advance to EXTRACT_BUILD_DEPS → return [item]
 EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
 BUILD_PACKAGE:    Build sdist and wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
-EXTRACT_INSTALL_DEPS: Extract install deps → create work items for all deps → advance to CLEANUP → return [item] + install_dep_items
-CLEANUP:          Clean build dirs → advance to COMPLETE → return [item]
-COMPLETE:         Update progress bar → return [] → done
+EXTRACT_INSTALL_DEPS: Extract install deps → create work items for all deps → advance to COMPLETE → return [item] + install_dep_items
+COMPLETE:         Clean build dirs → update progress bar → return [] → done
 ```
 
 **Example 2: Already seen package (duplicate dependency)**
@@ -647,9 +641,8 @@ Item: numpy-1.24.0, build_sdist_only=True
 START:            Add edge to graph → not in _seen_requirements → mark as seen (sdist only) → advance to EXTRACT_BUILD_DEPS → return [item]
 EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
 BUILD_PACKAGE:    build_sdist_only=True → build only sdist, skip wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
-EXTRACT_INSTALL_DEPS: Extract install deps from sdist → create work items for all deps → advance to CLEANUP → return [item] + install_dep_items
-CLEANUP:          Clean build dirs → advance to COMPLETE → return [item]
-COMPLETE:         Update progress bar → return [] → done
+EXTRACT_INSTALL_DEPS: Extract install deps from sdist → create work items for all deps → advance to COMPLETE → return [item] + install_dep_items
+COMPLETE:         Clean build dirs → update progress bar → return [] → done
 ```
 
 ## Additional Implementation Details
@@ -705,11 +698,11 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 
 **Benefits:**
 
-1. **Optimized**: Reduced from 9 to 6 phases by:
-   - Combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE)
+1. **Optimized**: Reduced from 9 to 5 phases by:
+   - Combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE, CLEANUP+COMPLETE→COMPLETE)
    - Eliminating PROCESS_INSTALL (stack handles depth-first automatically)
 2. **Simplicity**: Straightforward pipeline with one decision point (START)
-3. **Efficiency**: Already-seen packages stop at START (no flowing through 5 no-op phases)
+3. **Efficiency**: Already-seen packages stop at START (no flowing through 4 no-op phases)
 4. **Correctness**: Matches recursive behavior - duplicates don't update progress bar
 5. **No flag needed**: Eliminated `skip_processing` flag complexity
 
