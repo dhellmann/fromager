@@ -23,6 +23,21 @@ This approach:
 - Provides clear state management and debuggability
 - Eliminates recursion depth limits entirely
 
+## Key Refinements in This Plan
+
+This refined plan clarifies several critical details:
+
+01. **9 phases total** (not 8): BUILD split into EXTRACT_BUILD_DEPS and BUILD_PACKAGE for clarity
+02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
+03. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
+04. **Phase handler details**: Explicit function signatures, behavior, and state transitions
+05. **Seen requirements**: Detailed key format and marking logic
+06. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
+07. **Progress bar semantics**: When update_total() vs update() are called
+08. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
+09. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
+10. **Memory usage note**: Linear with dependency width due to why_snapshot copies
+
 ## Implementation Design
 
 ### 1. Work Item Structure
@@ -67,8 +82,9 @@ class BootstrapPhase(StrEnum):
     """Processing phases for a bootstrap work item."""
     GRAPH_UPDATE = "graph_update"         # Add to dependency graph
     SEEN_CHECK = "seen_check"             # Check if already processed
-    BUILD = "build"                       # Build package (handles build deps)
-    EXTRACT_DEPS = "extract_deps"         # Extract install dependencies
+    EXTRACT_BUILD_DEPS = "build_deps"             # Collect and push build dependencies
+    BUILD_PACKAGE = "build_package"       # Actually build the package
+    EXTRACT_INSTALL_DEPS = "extract_deps"         # Extract install dependencies
     BUILD_ORDER = "build_order"           # Record in build-order.json
     PROCESS_INSTALL = "process_install"   # Process install dependencies
     CLEANUP = "cleanup"                   # Clean build directories
@@ -118,45 +134,146 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
 
 ### 4. Phase Processing
 
-Implement phase handlers that process one phase and advance to the next:
+Implement phase handlers that process one phase and advance to the next.
 
-- `_phase_graph_update()`: Add to graph → advance to SEEN_CHECK
-- `_phase_seen_check()`: Check if seen → if new, mark seen and advance to BUILD; if seen, stop
-- `_phase_build()`: Build package (including build deps) → advance to EXTRACT_DEPS
-- `_phase_extract_deps()`: Extract install deps, call update_total() → advance to BUILD_ORDER
-- `_phase_build_order()`: Record in build-order.json → advance to PROCESS_INSTALL
-- `_phase_process_install()`: Push install deps to stack → advance to CLEANUP
-- `_phase_cleanup()`: Clean build dirs → advance to COMPLETE
-- `_phase_complete()`: Call progressbar.update() → done (don't push back)
+**Function signature:** `def _phase_X(self, item: BootstrapWorkItem, work_stack: list[BootstrapWorkItem]) -> None:`
+
+Phase handlers modify `item` in place and append to `work_stack` directly. They return `None`.
+
+#### Phase Handlers:
+
+- **`_phase_graph_update()`**: Add dependency graph edge from parent to this item → advance to SEEN_CHECK
+
+- **`_phase_seen_check()`**: Check if package already processed
+
+  - Key: `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
+  - If seen: Don't push back (terminate this branch)
+  - If not seen: Mark as seen, advance to EXTRACT_BUILD_DEPS, push back
+
+- **`_phase_build_deps()`**: Collect build dependencies and push to stack
+
+  - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies
+  - Call `update_total(len(build_dependencies))` for progress tracking
+  - Push build deps to work stack in reverse order (SDIST, BACKEND, SYSTEM)
+  - Advance to BUILD_PACKAGE, push back
+  - Build deps pop in correct order (SYSTEM, BACKEND, SDIST) and complete before parent continues
+
+- **`_phase_build_package()`**: Build the package (all build deps now complete)
+
+  - Call `_build_package()` to build sdist/wheel
+  - Store result in `item.build_result`
+  - Advance to EXTRACT_INSTALL_DEPS, push back
+
+- **`_phase_extract_deps()`**: Extract install dependencies
+
+  - Call `_get_install_dependencies()` to extract from wheel/sdist
+  - Handle exceptions in test_mode (non-fatal, use empty list)
+  - Call `update_total(len(install_dependencies))` for progress tracking
+  - Store in `item.install_dependencies`
+  - Advance to BUILD_ORDER, push back
+
+- **`_phase_build_order()`**: Record in build-order.json
+
+  - Call `self.build_order.append()`
+  - Advance to PROCESS_INSTALL, push back
+
+- **`_phase_process_install()`**: Process install dependencies depth-first
+
+  - If more deps remain (`item.install_dep_index < len(item.install_dependencies)`):
+    - Get next dependency
+    - Resolve versions for that dependency
+    - Increment `item.install_dep_index`
+    - Push current item back (to continue after dep completes)
+    - Push resolved dependency work items in reverse order
+  - If all deps processed: Advance to CLEANUP, push back
+
+- **`_phase_cleanup()`**: Clean build directories
+
+  - Call cleanup hooks/methods
+  - Advance to COMPLETE, push back
+
+- **`_phase_complete()`**: Mark package complete
+
+  - Call `self.progressbar.update()` to increment progress
+  - Don't push back (processing complete)
 
 ### 5. Build Dependencies Handling
 
 **Critical**: Build dependencies must complete BEFORE building the package.
 
-In `_phase_build()`:
+**Two-phase approach:**
 
-1. Push current item onto `self.why` stack
-2. Call `_prepare_build_dependencies_iterative()` which:
-   - Collects BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies
-   - Pushes them to work stack in reverse order (SDIST, BACKEND, SYSTEM)
-   - They pop in correct order (SYSTEM, BACKEND, SDIST) and process depth-first
-3. After build deps complete, build the package
-4. Pop from `self.why` stack
+1. **EXTRACT_BUILD_DEPS phase**: Collect and push build dependencies to stack
 
-The work stack LIFO order ensures build deps are processed to completion before the parent package continues.
+   - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies (3 separate calls)
+   - Push build deps to work stack in reverse order: SDIST, BACKEND, SYSTEM
+   - Push current item back with phase = BUILD_PACKAGE
+   - Return (let stack process build deps)
+
+2. **BUILD_PACKAGE phase**: Build the package (all build deps now complete)
+
+   - At this point, all build dependencies have been processed to completion
+   - Call `_build_package()` to build sdist and/or wheel
+   - Advance to EXTRACT_INSTALL_DEPS
+
+**Stack ordering ensures correctness:**
+
+- LIFO stack pops SYSTEM first → builds to completion (including its deps)
+- Then pops BACKEND → builds to completion
+- Then pops SDIST → builds to completion
+- Finally pops parent item in BUILD_PACKAGE phase → all build deps are ready
+
+**Example stack flow:**
+
+```
+Initial: [parent@EXTRACT_BUILD_DEPS]
+After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@GRAPH_UPDATE, BACKEND@GRAPH_UPDATE, SYSTEM@GRAPH_UPDATE]
+Pop SYSTEM → process fully → complete
+Pop BACKEND → process fully → complete
+Pop SDIST → process fully → complete
+Pop parent@BUILD_PACKAGE → build with all deps available
+```
 
 ### 6. Install Dependencies Handling
 
 In `_phase_process_install()`:
 
-1. If more install deps remain:
-   - Push current item back with incremented `install_dep_index`
-   - Resolve next install dep
-   - Push install dep work items to stack (in reverse order)
-2. If all install deps processed:
+1. If more install deps remain (`item.install_dep_index < len(item.install_dependencies)`):
+   - Get next dependency: `dep = item.install_dependencies[item.install_dep_index]`
+   - Resolve versions: `resolved_versions = self.resolve_versions(req=dep, req_type=RequirementType.INSTALL, return_all_versions=self.multiple_versions)`
+   - Increment index: `item.install_dep_index += 1`
+   - Push current item back (same phase, updated index)
+   - **Create and push dependency work items in reverse order:**
+     - For each `(source_url, resolved_version)` in `reversed(resolved_versions)`:
+       - Create work item with `parent=(item.req, item.resolved_version)`, `why_snapshot=self.why.copy()`, `phase=GRAPH_UPDATE`
+       - Append to work_stack
+2. If all deps processed:
    - Advance to CLEANUP phase
+   - Push current item back
 
-The LIFO stack ensures depth-first processing: each install dep and its transitive deps complete before the next install dep.
+**Depth-first processing with multiple versions:**
+
+Example: If dependency B resolves to versions [1.0, 2.0] and dependency C to \[3.0\]:
+
+```
+install_dependencies = [B, C]  # Process B first, then C
+
+Processing B (index 0):
+  resolved_versions = [(url_B_2.0, 2.0), (url_B_1.0, 1.0)]
+  Push: [parent@PROCESS_INSTALL(index=1), B-1.0@GRAPH_UPDATE, B-2.0@GRAPH_UPDATE]
+
+Stack pops: B-2.0 processes fully → B-1.0 processes fully → parent continues
+
+Processing C (index 1):
+  resolved_versions = [(url_C_3.0, 3.0)]
+  Push: [parent@PROCESS_INSTALL(index=2), C-3.0@GRAPH_UPDATE]
+
+Stack pops: C-3.0 processes fully → parent continues
+
+Index 2 >= len(install_dependencies) → advance to CLEANUP
+```
+
+The LIFO stack ensures depth-first processing: each install dep (all its versions) and transitive deps complete before the next install dep.
 
 ### 7. Progress Bar Updates
 
@@ -176,12 +293,12 @@ The COMPLETE phase is the final phase for each work item. It:
 
 **Phase flow:**
 
-- GRAPH_UPDATE → SEEN_CHECK → BUILD → EXTRACT_DEPS → BUILD_ORDER → PROCESS_INSTALL → CLEANUP → **COMPLETE**
+- GRAPH_UPDATE → SEEN_CHECK → BUILD → EXTRACT_INSTALL_DEPS → BUILD_ORDER → PROCESS_INSTALL → CLEANUP → **COMPLETE**
 - COMPLETE phase calls `update()` and finishes
 
 **Update totals:**
 
-- Call `update_total(len(install_dependencies))` in EXTRACT_DEPS phase when install deps are discovered
+- Call `update_total(len(install_dependencies))` in EXTRACT_INSTALL_DEPS phase when install deps are discovered
 - Call `update_total(len(build_dependencies))` in BUILD phase when build deps are discovered
 
 **Result**: Progress bar behaves identically to recursive version—updates after each package completes (including all its work and transitive dependencies).
@@ -237,7 +354,7 @@ while work_stack:
 Non-fatal errors (hooks, dependency extraction) are caught within phase handlers:
 
 ```python
-def _phase_extract_deps(self, item, work_stack):
+def _phase_extract_install_deps(self, item, work_stack):
     try:
         install_dependencies = self._get_install_dependencies(...)
     except Exception as dep_error:
@@ -250,6 +367,7 @@ def _phase_extract_deps(self, item, work_stack):
         install_dependencies = []
 
     item.install_dependencies = install_dependencies
+    self.progressbar.update_total(len(install_dependencies))
     item.phase = BootstrapPhase.BUILD_ORDER
     work_stack.append(item)
 ```
@@ -274,13 +392,24 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 **Primary file:**
 
 - `src/fromager/bootstrapper.py` (lines 270-526)
-  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum
+  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum (9 phases)
   - Replace `bootstrap()` method with iterative version
   - Replace `_bootstrap_single_version()` (lines 322-390) - logic moves to work item creation
   - Replace `_bootstrap_impl()` (lines 392-526) - logic splits into phase handlers
-  - Replace `_handle_build_requirements()` (lines 696-709) - logic moves to build phase
-  - Add 8 new phase handler methods (including COMPLETE)
-  - Add build dependency helpers
+  - Replace `_handle_build_requirements()` (lines 696-709) - logic moves to EXTRACT_BUILD_DEPS phase
+  - Add 9 new phase handler methods:
+    - `_phase_graph_update()`
+    - `_phase_seen_check()`
+    - `_phase_extract_build_deps()`
+    - `_phase_build_package()`
+    - `_phase_extract_install_deps()`
+    - `_phase_build_order()`
+    - `_phase_process_install()`
+    - `_phase_cleanup()`
+    - `_phase_complete()`
+  - Add `_process_phase()` dispatcher method
+  - Add `_handle_bootstrap_error()` error handling method
+  - Add `_get_current_parent()` helper (if doesn't exist) for extracting parent from `self.why`
   - Update main loop with error handling and self.why management
 
 **Reference files (read-only, for patterns):**
@@ -297,14 +426,14 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 ### Step 1: Add Data Structures (Low Risk)
 
-- Add `BootstrapPhase` enum (8 phases including COMPLETE)
+- Add `BootstrapPhase` enum (9 phases including COMPLETE)
 - Add `BootstrapWorkItem` dataclass
 - No behavior changes, not called yet
 
 ### Step 2: Add Phase Handler Methods (Low Risk)
 
-- Implement all 8 `_phase_*()` methods by extracting logic from `_bootstrap_impl()`
-- Implement build dependency helpers
+- Implement all 9 `_phase_*()` methods by extracting logic from `_bootstrap_impl()`
+- Implement `_process_phase()` dispatcher and `_handle_bootstrap_error()` helper
 - Not called yet, no behavior changes
 
 ### Step 3: Add Feature Flag (Low Risk)
@@ -342,31 +471,62 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 2. Main loop restores parent context: `self.why = item.why_snapshot.copy()`
 3. Main loop pushes current item: `self.why.append((item.req_type, item.req, item.resolved_version))`
 4. Main loop pops current item in try/except/else for error safety
-5. Phase handlers see current item on `self.why` during processing
+5. **Phase handlers MUST NOT manipulate `self.why`** - they see current item already on the stack
 
-**Main loop handles push/pop:**
+**Main loop handles ALL push/pop:**
 
 ```python
-# Restore parent context
-self.why = item.why_snapshot.copy()
+while work_stack:
+    item = work_stack.pop()
 
-# Push current item
-self.why.append((item.req_type, item.req, item.resolved_version))
+    # Restore parent context from snapshot
+    self.why = item.why_snapshot.copy()
 
-try:
-    self._process_phase(item, work_stack)
-except Exception as err:
-    self.why.pop()  # Cleanup on error
-    # ... handle error
-else:
-    self.why.pop()  # Cleanup on success
+    # Push current item (main loop responsibility, not phase handler)
+    self.why.append((item.req_type, item.req, item.resolved_version))
+
+    try:
+        self._process_phase(item, work_stack)
+    except Exception as err:
+        self.why.pop()  # Cleanup on error
+        # ... handle error based on mode
+    else:
+        self.why.pop()  # Cleanup on success
 ```
+
+**When creating child work items (in phase handlers):**
+
+Phase handlers create child work items with `why_snapshot=self.why.copy()`. At that point, `self.why` contains the current item (pushed by main loop), so children get correct parent context.
+
+**Example:** When PROCESS_INSTALL creates work item for dependency B:
+
+```python
+# self.why = [A, parent_item] (pushed by main loop)
+child_item = BootstrapWorkItem(
+    req=B,
+    why_snapshot=self.why.copy(),  # Captures [A, parent_item]
+    parent=(item.req, item.resolved_version),  # parent_item
+    ...
+)
+```
+
+When child processes later, main loop restores `self.why = [A, parent_item]` and pushes `[A, parent_item, B]`.
+
+**Helper method for creating parent tuple:**
+
+`_get_current_parent()` is called when creating work items:
+
+- Returns `None` if `self.why` is empty (root package)
+- Returns `(self.why[-1][1], self.why[-1][2])` if non-empty (parent req, parent version)
+
+For root packages in `bootstrap()`, `self.why` is empty before entering work loop → `parent=None`.
+For child work items in phase handlers, `self.why` contains current item → `parent=(current_req, current_version)`.
 
 This preserves exact behavior for:
 
-- `_processing_build_requirement()` (line 244-268) - checks `self.why` for build deps
-- `_explain` property (lines 579-585) - formats `self.why` for logging
-- Parent context extraction (lines 335-337) - reads `self.why[-1]`
+- `_processing_build_requirement()` (line 261-266) - walks `self.why` to check if current requirement is a build dependency
+- `_explain` property (lines 580-585) - formats `self.why` for logging
+- Parent context extraction - reads `self.why[-1]` when needed
 
 ## Verification Strategy
 
@@ -411,6 +571,65 @@ This preserves exact behavior for:
 2. Measure memory usage (should be similar or better)
 3. Profile for bottlenecks if needed
 
+## Additional Implementation Details
+
+### Seen Requirements Tracking
+
+**Key format** (defined at line 43 in bootstrapper.py):
+
+```python
+SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "wheel"]]
+```
+
+**Components:**
+
+1. `canonicalize_name(req.name)` — normalized package name
+2. `tuple(sorted(req.extras))` — sorted extras tuple (e.g., `("dev", "test")`)
+3. `str(version)` — version string
+4. `"sdist"` or `"wheel"` — build type
+
+**Marking logic** (lines 1383-1400):
+
+- When building wheel: Mark both `(..., "sdist")` and `(..., "wheel")` as seen (wheel implies sdist exists)
+- When building sdist-only: Mark only `(..., "sdist")` as seen
+
+**Used in SEEN_CHECK phase** to break cycles and avoid redundant work.
+
+### Progress Bar Behavior
+
+**Initialization:** If not provided to constructor, creates `progress.Progressbar(None)` (line 100)
+
+**Total tracking:** Cumulative count of all discovered dependencies
+
+- EXTRACT_BUILD_DEPS: `update_total(len(build_dependencies))` per build type (3 calls)
+- EXTRACT_INSTALL_DEPS: `update_total(len(install_dependencies))`
+
+**Progress tracking:** Incremented after each package fully completes
+
+- COMPLETE phase: `update()` called once per package
+
+**Result:** Progress bar shows "N of M packages processed" where M grows as dependencies are discovered.
+
+### Build Result Storage
+
+`item.build_result: SourceBuildResult | None` stores the result from `_build_package()`. Currently not used for control flow, but available for:
+
+- Error reporting
+- Future optimizations
+- Debugging
+
+### Test Mode Error Handling
+
+**Multiple error types** recorded in `self.failed_packages`:
+
+1. Resolution failures (line 297): Can't resolve requirement
+2. Bootstrap failures (lines 369-373): Exception during bootstrap
+3. Post-hook failures (lines 473-477): Non-fatal warning
+4. Dependency extraction failures (lines 490-500): Non-fatal warning, use empty list
+5. Build failures with fallback (lines 969-983): Try prebuilt, record if that fails too
+
+**Non-fatal vs fatal:** Only dependency extraction and post-hook failures are non-fatal in test mode. Other failures terminate that package's processing but continue to next package.
+
 ## Edge Cases Handled
 
 1. **Cyclic dependencies**: Prevented by `_seen_requirements` set (unchanged behavior)
@@ -421,6 +640,7 @@ This preserves exact behavior for:
 6. **Progress bar**: Uses COMPLETE phase to update after each package completes, matching recursive behavior exactly
 7. **Build/install dep ordering**: LIFO stack with correct push order ensures correct processing order
 8. **Self.why management**: Main loop handles push/pop with error safety, preserves dependency chain tracking
+9. **Memory usage**: Each work item stores `why_snapshot` copy. For very wide trees (thousands of parallel deps), memory usage increases linearly with width, but should be acceptable for typical Python packages
 
 ## Rollback Plan
 
