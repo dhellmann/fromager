@@ -124,19 +124,28 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
             new_items = self._process_phase(item)
             work_stack.extend(new_items)
 
-            # Update progress bar when work item completes (returns [])
-            # This handles both already-seen (START returns []) and
-            # finished processing (COMPLETE returns [])
-            if not new_items:
+            # Update progress bar based on return value
+            if len(new_items) == 0:
+                # Work completed (already seen or finished)
                 self.progressbar.update()
+            elif len(new_items) == 1:
+                # Same item continuing to next phase - no change to total
+                pass
+            else:
+                # Created dependencies: n items returned means n-1 net new work
+                self.progressbar.update_total(len(new_items) - 1)
         except Exception as err:
             # Handle error - may return items to continue processing
             new_items = self._handle_bootstrap_error(item, err)
             work_stack.extend(new_items)
 
-            # Update progress if error terminates this work item
-            if not new_items:
+            # Update progress bar based on return value
+            if len(new_items) == 0:
                 self.progressbar.update()
+            elif len(new_items) == 1:
+                pass
+            else:
+                self.progressbar.update_total(len(new_items) - 1)
         finally:
             self.why.pop()
 ```
@@ -183,13 +192,13 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
   - **Work:**
     - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies (3 calls)
-    - Call `update_total(len(build_dependencies))` for progress tracking
     - Create work items for build deps in reverse order (SDIST, BACKEND, SYSTEM)
     - Build deps pop in correct order (SYSTEM, BACKEND, SDIST) and complete before parent continues
   - **Next:** Advance to BUILD_PACKAGE
   - **Return:** `[item] + build_dep_items`
     - `item` goes on stack first (bottom), deps on top
     - LIFO stack pops deps first, then item continues
+    - Main loop sees n items returned → updates total by n-1 (net new work)
 
 - **`_phase_build_package()`**: Build the package and record in build order
 
@@ -206,7 +215,6 @@ Phase handlers modify `item` in place and return a list of work items to add to 
   - **Work:**
     - Call `_get_install_dependencies()` to extract from wheel/sdist
     - Handle exceptions in test_mode (non-fatal, use empty list)
-    - Call `update_total(len(install_dependencies))` for progress tracking
     - For each dependency (in reverse order for depth-first):
       - Resolve versions for that dependency
       - Create work items for dependency versions in reverse order
@@ -215,6 +223,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
   - **Return:** `[item] + dep_items` (all dependency work items at once)
     - `item` goes on stack first (bottom), deps on top
     - LIFO stack pops deps first, then item continues to COMPLETE
+    - Main loop sees n items returned → updates total by n-1 (net new work)
 
 - **`_phase_complete()`**: Clean up and mark package complete
 
@@ -364,7 +373,6 @@ In `_phase_extract_install_deps()`:
 def _phase_extract_install_deps(self, item):
     # Extract dependencies
     install_dependencies = self._get_install_dependencies(...)
-    self.progressbar.update_total(len(install_dependencies))
 
     # Create ALL dependency work items at once using helper
     dep_items = []
@@ -382,7 +390,9 @@ def _phase_extract_install_deps(self, item):
         ))
 
     item.phase = BootstrapPhase.COMPLETE
-    return [item] + dep_items  # Stack handles depth-first
+    # Return [item] + dep_items
+    # Main loop handles progress: if n items returned, update_total(n-1)
+    return [item] + dep_items
 ```
 
 **Depth-first processing with multiple versions:**
@@ -413,53 +423,67 @@ The LIFO stack ensures depth-first processing: each install dep (all its version
 
 ### 7. Progress Bar Updates
 
-**Current behavior** (lines 516, 522, 702, 709):
+**Simplified approach**: All progress bar logic centralized in the main loop. Phase handlers never touch the progress bar.
 
-- `update_total()` increases total count when dependencies are discovered
-- `update()` increments progress after EACH package completes (including building the package and processing all its transitive deps)
-
-**Challenge**: In recursive code, `update()` is called when a child's recursive call returns. In iterative code, we don't have a return point—we just return work items from phases.
-
-**Critical bug to avoid**: If phases call `update()`, already-seen packages get counted in `update_total()` but never reach the phase that calls `update()`, causing progress to get stuck.
-
-**Solution**: Main loop calls `update()` when work item completes
-
-The main loop is the only place that knows when a work item is done (phase returns `[]`):
+**Main loop logic based on return value:**
 
 ```python
 new_items = self._process_phase(item)
 work_stack.extend(new_items)
 
-# Update progress when work item completes (returns [])
-if not new_items:
+# Update progress bar based on return value
+if len(new_items) == 0:
+    # Work completed (already seen or finished)
     self.progressbar.update()
+elif len(new_items) == 1:
+    # Same item continuing to next phase - no change to total
+    pass
+else:
+    # Created dependencies: n items returned means n-1 net new work
+    self.progressbar.update_total(len(new_items) - 1)
 ```
-
-**Two completion scenarios:**
-
-1. **Already seen**: START returns `[]` → main loop calls `update()` → done
-2. **Fully processed**: COMPLETE returns `[]` → main loop calls `update()` → done
-
-**Update totals (unchanged):**
-
-- Call `update_total(len(install_dependencies))` in EXTRACT_INSTALL_DEPS phase when install deps are discovered
-- Call `update_total(len(build_dependencies))` in EXTRACT_BUILD_DEPS phase when build deps are discovered
 
 **Why this works:**
 
-Every work item created gets counted (via `update_total()`). Every work item eventually returns `[]` (either at START if already seen, or at COMPLETE if processed). Main loop calls `update()` for each `[]`, ensuring counts match.
+- **0 items returned**: Work item completed (START found already-seen, or COMPLETE finished processing) → increment progress
+- **1 item returned**: Same work item advancing to next phase (e.g., BUILD_PACKAGE → EXTRACT_INSTALL_DEPS) → no change (just continuing existing work)
+- **n items returned (n > 1)**: Work item created dependencies → net new work = n - 1
+  - Had 1 work item (parent), now have n items (parent + dependencies)
+  - Net increase = n - 1 new items to process
+  - Update total to reflect new work discovered
 
-**Example:**
+**Example 1: Item with 3 dependencies**
 
 ```
-Parent extracts deps [A, B, C] → calls update_total(3) → total = 3
-A processes → COMPLETE returns [] → main loop calls update() → progress = 1
-B already seen → START returns [] → main loop calls update() → progress = 2
-C processes → COMPLETE returns [] → main loop calls update() → progress = 3
-Result: 100% complete ✓
+EXTRACT_INSTALL_DEPS returns [item, dep1, dep2, dep3] (4 items)
+Main loop: len(new_items) = 4 → update_total(4 - 1 = 3)
+Logic: Had 1 item, now have 4 → +3 net new work ✓
 ```
 
-**Result**: Progress bar behaves identically to recursive version—updates after each package completes (including all its work and transitive dependencies).
+**Example 2: Already seen package**
+
+```
+START returns [] (0 items)
+Main loop: len(new_items) = 0 → update()
+Logic: Work completed without creating dependencies ✓
+```
+
+**Example 3: Item advancing to next phase**
+
+```
+BUILD_PACKAGE returns [item] (1 item)
+Main loop: len(new_items) = 1 → no change
+Logic: Same work continuing, not creating new work ✓
+```
+
+**Advantages:**
+
+1. **Separation of concerns**: Phase handlers focus on business logic, main loop handles progress
+2. **Automatic correctness**: Math works automatically based on return values
+3. **No manual tracking**: Phase handlers don't need to count dependencies
+4. **Centralized logic**: All progress bar handling in one place
+
+**Result**: Progress bar behaves identically to recursive version—updates after each package completes, total grows as dependencies are discovered.
 
 **Initialization fix required:**
 
@@ -537,9 +561,11 @@ def _phase_extract_install_deps(self, item):
         )
         install_dependencies = []
 
-    self.progressbar.update_total(len(install_dependencies))
+    # Create dependency work items (if any)
+    # ... create dep_items from install_dependencies ...
+
     item.phase = BootstrapPhase.COMPLETE
-    return [item]
+    return [item] + dep_items  # Main loop handles progress update
 ```
 
 #### Failed Dependency Handling - Lazy Cleanup
@@ -819,10 +845,10 @@ Main loop:           Sees [] → calls progressbar.update() → done
 Item: urllib3-2.0.0
 
 START:      Add edge to graph → found in _seen_requirements → return []
-Main loop:  Sees [] → calls progressbar.update() ← STOPS HERE!
+Main loop:  Sees 0 items → calls update() ← STOPS HERE!
 
 (Item removed from pipeline - doesn't flow through remaining phases)
-(Progress bar updated for duplicates - they were counted in update_total())
+(Progress bar updated - this work item is now complete)
 ```
 
 **Example 3: sdist_only mode**
@@ -866,16 +892,17 @@ Used in the START phase to break cycles and avoid redundant work.
 
 **Initialization:** If not provided to constructor, creates `progress.Progressbar(None)` (line 100)
 
-**Total tracking:** Cumulative count of all discovered dependencies
+**Total tracking:** Updated automatically by main loop based on phase return values
 
-- EXTRACT_BUILD_DEPS: `update_total(len(build_dependencies))` per build type (3 calls)
-- EXTRACT_INSTALL_DEPS: `update_total(len(install_dependencies))`
+- Phase returns n items (n > 1): Main loop calls `update_total(n - 1)` for net new work
+- Phase handlers never touch progress bar
 
-**Progress tracking:** Incremented after each package fully completes
+**Progress tracking:** Incremented after each work item completes
 
-- COMPLETE phase: `update()` called once per package
+- Phase returns 0 items: Main loop calls `update()` (work completed)
+- Both already-seen packages (START → []) and finished packages (COMPLETE → []) increment progress
 
-**Result:** Progress bar shows "N of M packages processed" where M grows as dependencies are discovered.
+**Result:** Progress bar shows "N of M packages processed" where M grows automatically as dependencies are discovered.
 
 ### Build Result Storage
 
