@@ -27,15 +27,15 @@ This approach:
 
 This refined plan clarifies several critical details:
 
-01. **9 phases total** (not 8): BUILD split into EXTRACT_BUILD_DEPS and BUILD_PACKAGE for clarity
+01. **7 phases total**: Optimized from 9 to 7 by combining related phases (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE)
 02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
-03. **Linear progression with early exit**: SEEN_CHECK acts as filter - already-seen packages return `[]` and stop flowing (no skip_processing flag needed)
+03. **Linear progression with early exit**: START acts as filter - already-seen packages return `[]` and stop flowing (no skip_processing flag needed)
 04. **Functional phase handlers**: Phase handlers return lists of work items instead of modifying the stack directly; main loop extends stack with returned items
 05. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
 06. **Phase handler details**: Explicit function signatures, behavior, and return values
 07. **Seen requirements**: Detailed key format and marking logic
 08. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
-09. **Progress bar correctness**: Only new packages reach COMPLETE; duplicates stop at SEEN_CHECK, matching recursive behavior
+09. **Progress bar correctness**: Only new packages reach COMPLETE; duplicates stop at START, matching recursive behavior
 10. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
 11. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
 12. **Memory usage note**: Linear with dependency width due to why_snapshot copies
@@ -69,7 +69,7 @@ class BootstrapWorkItem:
     why_snapshot: list[tuple[RequirementType, Requirement, Version]]
 
     # Processing phase
-    phase: BootstrapPhase = BootstrapPhase.GRAPH_UPDATE
+    phase: BootstrapPhase = BootstrapPhase.START
 
     # Phase-specific state
     build_result: SourceBuildResult | None = None
@@ -84,12 +84,10 @@ Add an enum for the distinct processing phases:
 ```python
 class BootstrapPhase(StrEnum):
     """Processing phases for a bootstrap work item."""
-    GRAPH_UPDATE = "graph_update"         # Add to dependency graph
-    SEEN_CHECK = "seen_check"             # Check if already processed
-    EXTRACT_BUILD_DEPS = "build_deps"             # Collect and push build dependencies
-    BUILD_PACKAGE = "build_package"       # Actually build the package
-    EXTRACT_INSTALL_DEPS = "extract_deps"         # Extract install dependencies
-    BUILD_ORDER = "build_order"           # Record in build-order.json
+    START = "start"                       # Add to graph and check if already seen
+    EXTRACT_BUILD_DEPS = "build_deps"     # Collect and push build dependencies
+    BUILD_PACKAGE = "build_package"       # Build package and record in build-order.json
+    EXTRACT_INSTALL_DEPS = "extract_deps" # Extract install dependencies
     PROCESS_INSTALL = "process_install"   # Process install dependencies
     CLEANUP = "cleanup"                   # Clean build directories
     COMPLETE = "complete"                 # Done
@@ -119,7 +117,7 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
             parent=self._get_current_parent(),
             why_snapshot=self.why.copy(),
             build_sdist_only=self._should_build_sdist_only(req_type),
-            phase=BootstrapPhase.GRAPH_UPDATE,
+            phase=BootstrapPhase.START,
         ))
 
     # Process work stack (LIFO = depth-first)
@@ -144,7 +142,7 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
 
 ### 4. Phase Processing
 
-**Linear progression with early exit:** Work items flow through phases linearly. SEEN_CHECK acts as a filter - if a package has already been processed, it returns `[]` and the item stops flowing through the pipeline.
+**Linear progression with early exit:** Work items flow through phases linearly. START acts as a filter - if a package has already been processed, it returns `[]` and the item stops flowing through the pipeline.
 
 **Function signature:** `def _phase_X(self, item: BootstrapWorkItem) -> list[BootstrapWorkItem]:`
 
@@ -154,7 +152,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
 1. Do work for this phase (may create dependency work items)
 2. Check if processing should stop:
-   - SEEN_CHECK: If already seen, return `[]` (stop processing)
+   - START: If already seen, return `[]` (stop processing)
    - COMPLETE: Always return `[]` (end of pipeline)
 3. Otherwise, advance `item.phase` to next phase
 4. Return list of items to add to stack:
@@ -166,15 +164,11 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
 #### Phase Handlers (Linear Progression with Early Exit):
 
-- **`_phase_graph_update()`**: Add dependency graph edge
+- **`_phase_start()`**: Add to graph and check if already processed (filter/gatekeeper phase)
 
-  - **Work:** Add edge from parent to this item in dependency graph (always do this)
-  - **Next:** Advance to SEEN_CHECK
-  - **Return:** `[item]`
-
-- **`_phase_seen_check()`**: Check if already processed (filter/gatekeeper phase)
-
-  - **Key:** `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
+  - **Work:**
+    - Add edge from parent to this item in dependency graph (always do this)
+    - Check seen key: `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
   - **If already seen:**
     - Return `[]` ← **Early exit! Item stops here, doesn't flow through remaining phases**
   - **If not seen:**
@@ -192,12 +186,13 @@ Phase handlers modify `item` in place and return a list of work items to add to 
   - **Next:** Advance to BUILD_PACKAGE
   - **Return:** `[item] + build_dep_items`
 
-- **`_phase_build_package()`**: Build the package
+- **`_phase_build_package()`**: Build the package and record in build order
 
   - **Work:**
     - Call `_build_package()` to build sdist and/or wheel
     - Respects `item.build_sdist_only` flag (skip wheel if True)
     - Store result in `item.build_result`
+    - Call `self.build_order.append()` to record in build-order.json
   - **Next:** Advance to EXTRACT_INSTALL_DEPS
   - **Return:** `[item]`
 
@@ -208,12 +203,6 @@ Phase handlers modify `item` in place and return a list of work items to add to 
     - Handle exceptions in test_mode (non-fatal, use empty list)
     - Call `update_total(len(install_dependencies))` for progress tracking
     - Store in `item.install_dependencies`
-  - **Next:** Advance to BUILD_ORDER
-  - **Return:** `[item]`
-
-- **`_phase_build_order()`**: Record in build-order.json
-
-  - **Work:** Call `self.build_order.append()`
   - **Next:** Advance to PROCESS_INSTALL
   - **Return:** `[item]`
 
@@ -268,9 +257,9 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
 **Stack ordering ensures correctness:**
 
-- LIFO stack pops SYSTEM first → processes through all 9 phases → completes
-- Then pops BACKEND → processes through all 9 phases → completes
-- Then pops SDIST → processes through all 9 phases → completes
+- LIFO stack pops SYSTEM first → processes through all 7 phases → completes
+- Then pops BACKEND → processes through all 7 phases → completes
+- Then pops SDIST → processes through all 7 phases → completes
 - Finally pops parent item in BUILD_PACKAGE phase → all build deps are ready
 
 **Example stack flow:**
@@ -278,9 +267,9 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 ```
 Initial: [parent@EXTRACT_BUILD_DEPS]
 After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@GRAPH_UPDATE, BACKEND@GRAPH_UPDATE, SYSTEM@GRAPH_UPDATE]
-Pop SYSTEM → flows through all 9 phases → completes
-Pop BACKEND → flows through all 9 phases → completes
-Pop SDIST → flows through all 9 phases → completes
+Pop SYSTEM → flows through all 7 phases → completes
+Pop BACKEND → flows through all 7 phases → completes
+Pop SDIST → flows through all 7 phases → completes
 Pop parent@BUILD_PACKAGE → build with all deps available → continues to EXTRACT_INSTALL_DEPS → ... → COMPLETE
 ```
 
@@ -442,7 +431,7 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 **Primary file:**
 
 - `src/fromager/bootstrapper.py` (lines 270-526)
-  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum (9 phases)
+  - Add `BootstrapWorkItem` dataclass and `BootstrapPhase` enum (7 phases)
   - Replace `bootstrap()` method with iterative version
   - Replace `_bootstrap_single_version()` (lines 322-390) - logic moves to work item creation
   - Replace `_bootstrap_impl()` (lines 392-526) - logic splits into phase handlers
@@ -476,7 +465,7 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 ### Step 1: Add Data Structures (Low Risk)
 
-- Add `BootstrapPhase` enum (9 phases including COMPLETE)
+- Add `BootstrapPhase` enum (7 phases including COMPLETE)
 - Add `BootstrapWorkItem` dataclass
 - No behavior changes, not called yet
 
@@ -626,17 +615,15 @@ This preserves exact behavior for:
 **Example 1: New package (not seen before)**
 
 ```
-Item: requests-2.31.0, skip_processing=False
+Item: requests-2.31.0
 
-GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK
-SEEN_CHECK:       Not in _seen_requirements → mark as seen → skip_processing=False → advance to EXTRACT_BUILD_DEPS
-EXTRACT_BUILD_DEPS: Extract build deps → push deps to stack → advance to BUILD_PACKAGE
-BUILD_PACKAGE:    Build sdist and wheel → advance to EXTRACT_INSTALL_DEPS
-EXTRACT_INSTALL_DEPS: Extract install deps → advance to BUILD_ORDER
-BUILD_ORDER:      Add to build-order.json → advance to PROCESS_INSTALL
-PROCESS_INSTALL:  Push install deps to stack (loop if multiple) → advance to CLEANUP
-CLEANUP:          Clean build dirs → advance to COMPLETE
-COMPLETE:         Update progress bar → done
+START:            Add edge to graph → not in _seen_requirements → mark as seen → advance to EXTRACT_BUILD_DEPS → return [item]
+EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
+BUILD_PACKAGE:    Build sdist and wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
+EXTRACT_INSTALL_DEPS: Extract install deps → advance to PROCESS_INSTALL → return [item]
+PROCESS_INSTALL:  Push install deps to stack (loop if multiple) → advance to CLEANUP → return [item] + install_dep_items
+CLEANUP:          Clean build dirs → advance to COMPLETE → return [item]
+COMPLETE:         Update progress bar → return [] → done
 ```
 
 **Example 2: Already seen package (duplicate dependency)**
@@ -644,8 +631,7 @@ COMPLETE:         Update progress bar → done
 ```
 Item: urllib3-2.0.0
 
-GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK → return [item]
-SEEN_CHECK:       Found in _seen_requirements → return [] ← STOPS HERE!
+START:            Add edge to graph → found in _seen_requirements → return [] ← STOPS HERE!
 
 (Item removed from pipeline - doesn't flow through remaining phases)
 (No progress bar update for duplicates - matches recursive behavior)
@@ -656,12 +642,10 @@ SEEN_CHECK:       Found in _seen_requirements → return [] ← STOPS HERE!
 ```
 Item: numpy-1.24.0, build_sdist_only=True
 
-GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK → return [item]
-SEEN_CHECK:       Not in _seen_requirements → mark as seen (sdist only) → advance to EXTRACT_BUILD_DEPS → return [item]
+START:            Add edge to graph → not in _seen_requirements → mark as seen (sdist only) → advance to EXTRACT_BUILD_DEPS → return [item]
 EXTRACT_BUILD_DEPS: Extract build deps → advance to BUILD_PACKAGE → return [item] + build_dep_items
-BUILD_PACKAGE:    build_sdist_only=True → build only sdist, skip wheel → advance to EXTRACT_INSTALL_DEPS → return [item]
-EXTRACT_INSTALL_DEPS: Extract install deps from sdist → advance to BUILD_ORDER → return [item]
-BUILD_ORDER:      Add to build-order.json → advance to PROCESS_INSTALL → return [item]
+BUILD_PACKAGE:    build_sdist_only=True → build only sdist, skip wheel → record in build-order.json → advance to EXTRACT_INSTALL_DEPS → return [item]
+EXTRACT_INSTALL_DEPS: Extract install deps from sdist → advance to PROCESS_INSTALL → return [item]
 PROCESS_INSTALL:  Push install deps to stack → advance to CLEANUP → return [item] + install_dep_items
 CLEANUP:          Clean build dirs → advance to COMPLETE → return [item]
 COMPLETE:         Update progress bar → return [] → done
@@ -716,23 +700,24 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 
 ### Linear Phase Progression with Early Exit
 
-**Design choice:** Work items flow through phases linearly with SEEN_CHECK acting as a filter/gatekeeper.
+**Design choice:** Work items flow through phases linearly with START acting as a filter/gatekeeper.
 
 **Benefits:**
 
-1. **Simplicity**: Straightforward pipeline with one decision point (SEEN_CHECK)
-2. **Efficiency**: Already-seen packages stop at SEEN_CHECK (no flowing through 7 no-op phases)
-3. **Correctness**: Matches recursive behavior - duplicates don't update progress bar
-4. **No flag needed**: Eliminated `skip_processing` flag complexity
+1. **Optimized**: Reduced from 9 to 7 phases by combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE)
+2. **Simplicity**: Straightforward pipeline with one decision point (START)
+3. **Efficiency**: Already-seen packages stop at START (no flowing through 6 no-op phases)
+4. **Correctness**: Matches recursive behavior - duplicates don't update progress bar
+5. **No flag needed**: Eliminated `skip_processing` flag complexity
 
 **How modes are handled:**
 
-- **Already seen packages**: SEEN_CHECK returns `[]`, item stops flowing (early exit)
+- **Already seen packages**: START returns `[]`, item stops flowing (early exit)
 - **sdist_only mode**: BUILD_PACKAGE checks `item.build_sdist_only` flag and skips wheel build
 - **Test mode errors**: EXTRACT_INSTALL_DEPS catches exceptions, uses empty list, continues to next phase
 - **Multiple versions**: Each version is independent work item flowing through same phases
 
-**Simple pipeline**: GRAPH_UPDATE (always) → SEEN_CHECK (filter) → work phases → COMPLETE
+**Simple pipeline**: START (filter) → work phases → COMPLETE
 
 ### Test Mode Error Handling
 
@@ -752,7 +737,7 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 02. **Multiple versions mode**: Each version is independent work item with own error handling
 03. **Test mode fallback**: Build failures trigger prebuilt fallback within `_build_package()`
 04. **sdist_only mode**: BUILD_PACKAGE phase checks `item.build_sdist_only` flag and skips wheel build
-05. **Already seen packages**: SEEN_CHECK returns `[]`, stopping the item from flowing through remaining phases (early exit)
+05. **Already seen packages**: START returns `[]`, stopping the item from flowing through remaining phases (early exit)
 06. **Progress bar correctness**: Only new packages reach COMPLETE and update progress bar; duplicates stop at SEEN_CHECK, matching recursive behavior
 07. **Git URL requirements**: Resolution unchanged, happens before work item creation
 08. **Deep chains**: Work stack on heap, no recursion limit
