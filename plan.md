@@ -23,23 +23,6 @@ This approach:
 - Provides clear state management and debuggability
 - Eliminates recursion depth limits entirely
 
-## Key Refinements in This Plan
-
-This refined plan clarifies several critical details:
-
-01. **5 phases total**: Optimized from 9 to 5 by combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE, CLEANUP+COMPLETE→COMPLETE) and eliminating unnecessary PROCESS_INSTALL phase (stack handles depth-first automatically)
-02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
-03. **Linear progression with early exit**: START acts as filter - already-seen packages return `[]` and stop flowing; main loop updates progress bar when it sees `[]` (no skip_processing flag needed)
-04. **Functional phase handlers**: Phase handlers return lists of work items instead of modifying the stack directly; main loop extends stack with returned items
-05. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
-06. **Phase handler details**: Explicit function signatures, behavior, and return values
-07. **Seen requirements**: Detailed key format and marking logic
-08. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
-09. **Progress bar correctness**: Main loop calls `update()` when phase returns `[]` (work done); handles both already-seen (START→`[]`) and fully-processed (COMPLETE→`[]`)
-10. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
-11. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
-12. **Memory usage note**: Linear with dependency width due to why_snapshot copies
-
 ## Implementation Design
 
 ### 1. Work Item Structure
@@ -52,7 +35,7 @@ class BootstrapWorkItem:
     """Represents a single bootstrap work item (stack frame).
 
     Each work item processes one package version through multiple phases.
-    Items flow through phases linearly until SEEN_CHECK determines if
+    Items flow through phases linearly with START phase determining if
     processing should continue or stop.
     """
     # Core requirement info
@@ -166,9 +149,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
    - May include dependency items: `[item, dep1, dep2, ...]` (in reverse order for LIFO)
    - Return `[]` to stop processing this item
 
-**Exception: PROCESS_INSTALL** may loop back to itself (increments `install_dep_index` instead of advancing phase) until all dependencies processed.
-
-#### Phase Handlers (Linear Progression with Early Exit):
+#### Phase Handlers:
 
 - **`_phase_start()`**: Add to graph and check if already processed (filter/gatekeeper phase)
 
@@ -258,7 +239,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 
 ```
 Initial: [parent@EXTRACT_BUILD_DEPS]
-After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@GRAPH_UPDATE, BACKEND@GRAPH_UPDATE, SYSTEM@GRAPH_UPDATE]
+After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@START, BACKEND@START, SYSTEM@START]
 Pop SYSTEM → flows through all 5 phases → completes
 Pop BACKEND → flows through all 5 phases → completes
 Pop SDIST → flows through all 5 phases → completes
@@ -272,8 +253,6 @@ In `_phase_extract_install_deps()`:
 1. Extract install dependencies from wheel/sdist
 2. For each dependency, resolve versions and create work items
 3. Return all work items at once - stack handles depth-first automatically
-
-**Simplified approach - no looping needed:**
 
 ```python
 def _phase_extract_install_deps(self, item):
@@ -298,7 +277,7 @@ def _phase_extract_install_deps(self, item):
                 ...
             ))
 
-    item.phase = BootstrapPhase.CLEANUP
+    item.phase = BootstrapPhase.COMPLETE
     return [item] + dep_items  # Stack handles depth-first
 ```
 
@@ -315,18 +294,18 @@ EXTRACT_INSTALL_DEPS creates ALL work items at once:
   For C: resolved_versions = [(3.0, url)]
     Create: C-3.0@START
 
-  Return: [parent@CLEANUP, C-3.0@START, B-2.0@START, B-1.0@START]
+  Return: [parent@COMPLETE, C-3.0@START, B-2.0@START, B-1.0@START]
   (Note: reversed order for LIFO depth-first)
 
 Stack pops and processes:
   B-1.0 → processes fully → complete
   B-2.0 → processes fully → complete
   C-3.0 → processes fully → complete
-  parent@CLEANUP → continues
+  parent@COMPLETE → continues
 
 ```
 
-The LIFO stack ensures depth-first processing: each install dep (all its versions) and transitive deps complete before the next install dep. No phase looping needed!
+The LIFO stack ensures depth-first processing: each install dep (all its versions) and transitive deps complete before the next install dep.
 
 ### 7. Progress Bar Updates
 
@@ -437,9 +416,8 @@ def _phase_extract_install_deps(self, item):
         )
         install_dependencies = []
 
-    item.install_dependencies = install_dependencies
     self.progressbar.update_total(len(install_dependencies))
-    item.phase = BootstrapPhase.BUILD_ORDER
+    item.phase = BootstrapPhase.COMPLETE
     return [item]
 ```
 
@@ -468,15 +446,11 @@ When a package fails, its dependencies may already be on the work stack. Use **l
   - Replace `_bootstrap_single_version()` (lines 322-390) - logic moves to work item creation
   - Replace `_bootstrap_impl()` (lines 392-526) - logic splits into phase handlers
   - Replace `_handle_build_requirements()` (lines 696-709) - logic moves to EXTRACT_BUILD_DEPS phase
-  - Add 9 new phase handler methods:
-    - `_phase_graph_update()`
-    - `_phase_seen_check()`
+  - Add 5 new phase handler methods:
+    - `_phase_start()`
     - `_phase_extract_build_deps()`
     - `_phase_build_package()`
     - `_phase_extract_install_deps()`
-    - `_phase_build_order()`
-    - `_phase_process_install()`
-    - `_phase_cleanup()`
     - `_phase_complete()`
   - Add `_process_phase()` dispatcher method
   - Add `_handle_bootstrap_error()` error handling method
@@ -704,7 +678,7 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 - When building wheel: Mark both `(..., "sdist")` and `(..., "wheel")` as seen (wheel implies sdist exists)
 - When building sdist-only: Mark only `(..., "sdist")` as seen
 
-**Used in SEEN_CHECK phase** to break cycles and avoid redundant work.
+Used in the START phase to break cycles and avoid redundant work.
 
 ### Progress Bar Behavior
 
@@ -735,13 +709,9 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 
 **Benefits:**
 
-1. **Optimized**: Reduced from 9 to 5 phases by:
-   - Combining related operations (GRAPH_UPDATE+SEEN_CHECK→START, BUILD_PACKAGE+BUILD_ORDER→BUILD_PACKAGE, CLEANUP+COMPLETE→COMPLETE)
-   - Eliminating PROCESS_INSTALL (stack handles depth-first automatically)
-2. **Simplicity**: Straightforward pipeline with one decision point (START)
-3. **Efficiency**: Already-seen packages stop at START (no flowing through 4 no-op phases)
-4. **Correctness**: Matches recursive behavior - duplicates don't update progress bar
-5. **No flag needed**: Eliminated `skip_processing` flag complexity
+1. **Simplicity**: Straightforward pipeline with one decision point (START)
+2. **Efficiency**: Already-seen packages stop at START and don't flow through remaining phases
+3. **Correctness**: Matches recursive behavior - duplicates don't update progress bar
 
 **How modes are handled:**
 
