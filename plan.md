@@ -29,14 +29,15 @@ This refined plan clarifies several critical details:
 
 01. **9 phases total** (not 8): BUILD split into EXTRACT_BUILD_DEPS and BUILD_PACKAGE for clarity
 02. **Phase naming consistency**: EXTRACT_BUILD_DEPS and EXTRACT_INSTALL_DEPS for parallel structure
-03. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
-04. **Phase handler details**: Explicit function signatures, behavior, and state transitions
-05. **Seen requirements**: Detailed key format and marking logic
-06. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
-07. **Progress bar semantics**: When update_total() vs update() are called
-08. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
-09. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
-10. **Memory usage note**: Linear with dependency width due to why_snapshot copies
+03. **Linear phase progression**: Every work item flows through all 9 phases sequentially; phases check `skip_processing` flag internally to decide whether to do work
+04. **self.why management**: Main loop handles ALL push/pop, phase handlers MUST NOT touch it
+05. **Phase handler details**: Explicit function signatures, behavior, and state transitions
+06. **Seen requirements**: Detailed key format and marking logic
+07. **Multiple versions handling**: Concrete example of how dependencies with multiple versions are processed depth-first
+08. **Progress bar semantics**: When update_total() vs update() are called
+09. **Error handling specifics**: Which errors are fatal vs non-fatal in test mode
+10. **Helper methods**: \_get_current_parent(), \_process_phase(), \_handle_bootstrap_error()
+11. **Memory usage note**: Linear with dependency width due to why_snapshot copies
 
 ## Implementation Design
 
@@ -50,6 +51,7 @@ class BootstrapWorkItem:
     """Represents a single bootstrap work item (stack frame).
 
     Each work item processes one package version through multiple phases.
+    All items flow through all 9 phases linearly.
     """
     # Core requirement info
     req: Requirement
@@ -66,6 +68,9 @@ class BootstrapWorkItem:
 
     # Processing phase
     phase: BootstrapPhase = BootstrapPhase.GRAPH_UPDATE
+
+    # Processing control
+    skip_processing: bool = False  # Set by SEEN_CHECK if already processed
 
     # Phase-specific state
     build_result: SourceBuildResult | None = None
@@ -134,93 +139,122 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
 
 ### 4. Phase Processing
 
-Implement phase handlers that process one phase and advance to the next.
+**Linear progression approach:** Every work item flows through all 9 phases sequentially. Each phase checks `item.skip_processing` flag and either does work or becomes a no-op, then always advances to the next phase.
 
 **Function signature:** `def _phase_X(self, item: BootstrapWorkItem, work_stack: list[BootstrapWorkItem]) -> None:`
 
 Phase handlers modify `item` in place and append to `work_stack` directly. They return `None`.
 
-#### Phase Handlers:
+**All phase handlers follow this pattern:**
 
-- **`_phase_graph_update()`**: Add dependency graph edge from parent to this item → advance to SEEN_CHECK
+1. Check if work should be skipped (`item.skip_processing` or other settings)
+2. Do work if not skipping
+3. Advance `item.phase` to next phase
+4. Push `item` back to `work_stack` (except COMPLETE)
 
-- **`_phase_seen_check()`**: Check if package already processed
+**Exception: PROCESS_INSTALL** may loop back to itself (increments `install_dep_index` instead of advancing phase) until all dependencies processed.
 
-  - Key: `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
-  - If seen: Don't push back (terminate this branch)
-  - If not seen: Mark as seen, advance to EXTRACT_BUILD_DEPS, push back
+#### Phase Handlers (Linear Progression):
 
-- **`_phase_build_deps()`**: Collect build dependencies and push to stack
+- **`_phase_graph_update()`**: Add dependency graph edge
 
-  - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies
-  - Call `update_total(len(build_dependencies))` for progress tracking
-  - Push build deps to work stack in reverse order (SDIST, BACKEND, SYSTEM)
-  - Advance to BUILD_PACKAGE, push back
-  - Build deps pop in correct order (SYSTEM, BACKEND, SDIST) and complete before parent continues
+  - **Work:** Add edge from parent to this item in dependency graph (always do this)
+  - **Next:** Advance to SEEN_CHECK, push back
 
-- **`_phase_build_package()`**: Build the package (all build deps now complete)
+- **`_phase_seen_check()`**: Check if already processed
 
-  - Call `_build_package()` to build sdist/wheel
-  - Store result in `item.build_result`
-  - Advance to EXTRACT_INSTALL_DEPS, push back
+  - **Key:** `(canonicalize_name(item.req.name), tuple(sorted(item.req.extras)), str(item.resolved_version), "sdist"/"wheel")`
+  - **If seen:** Set `item.skip_processing = True`
+  - **If not seen:** Mark as seen in `self._seen_requirements`
+  - **Next:** Advance to EXTRACT_BUILD_DEPS, push back
 
-- **`_phase_extract_deps()`**: Extract install dependencies
+- **`_phase_extract_build_deps()`**: Collect build dependencies
 
-  - Call `_get_install_dependencies()` to extract from wheel/sdist
-  - Handle exceptions in test_mode (non-fatal, use empty list)
-  - Call `update_total(len(install_dependencies))` for progress tracking
-  - Store in `item.install_dependencies`
-  - Advance to BUILD_ORDER, push back
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:**
+    - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies (3 calls)
+    - Call `update_total(len(build_dependencies))` for progress tracking
+    - Push build deps to work stack in reverse order (SDIST, BACKEND, SYSTEM)
+    - Build deps pop in correct order (SYSTEM, BACKEND, SDIST) and complete before parent continues
+  - **Next:** Advance to BUILD_PACKAGE, push back
+
+- **`_phase_build_package()`**: Build the package
+
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:**
+    - Call `_build_package()` to build sdist and/or wheel
+    - Respects `item.build_sdist_only` flag (skip wheel if True)
+    - Store result in `item.build_result`
+  - **Next:** Advance to EXTRACT_INSTALL_DEPS, push back
+
+- **`_phase_extract_install_deps()`**: Extract install dependencies
+
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:**
+    - Call `_get_install_dependencies()` to extract from wheel/sdist
+    - Handle exceptions in test_mode (non-fatal, use empty list)
+    - Call `update_total(len(install_dependencies))` for progress tracking
+    - Store in `item.install_dependencies`
+  - **Next:** Advance to BUILD_ORDER, push back
 
 - **`_phase_build_order()`**: Record in build-order.json
 
-  - Call `self.build_order.append()`
-  - Advance to PROCESS_INSTALL, push back
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:** Call `self.build_order.append()`
+  - **Next:** Advance to PROCESS_INSTALL, push back
 
 - **`_phase_process_install()`**: Process install dependencies depth-first
 
-  - If more deps remain (`item.install_dep_index < len(item.install_dependencies)`):
-    - Get next dependency
-    - Resolve versions for that dependency
-    - Increment `item.install_dep_index`
-    - Push current item back (to continue after dep completes)
-    - Push resolved dependency work items in reverse order
-  - If all deps processed: Advance to CLEANUP, push back
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:**
+    - **If more deps remain** (`item.install_dep_index < len(item.install_dependencies)`):
+      - Get next dependency
+      - Resolve versions for that dependency
+      - Increment `item.install_dep_index`
+      - Push current item back (**same phase**, updated index)
+      - Push resolved dependency work items in reverse order
+      - Return (don't advance phase yet)
+    - **If all deps processed:** Continue to next phase
+  - **Next:** Advance to CLEANUP, push back
 
 - **`_phase_cleanup()`**: Clean build directories
 
-  - Call cleanup hooks/methods
-  - Advance to COMPLETE, push back
+  - **Skip if:** `item.skip_processing == True`
+  - **Work:** Call cleanup hooks/methods
+  - **Next:** Advance to COMPLETE, push back
 
 - **`_phase_complete()`**: Mark package complete
 
-  - Call `self.progressbar.update()` to increment progress
-  - Don't push back (processing complete)
+  - **Work:** Call `self.progressbar.update()` to increment progress (always do this)
+  - **Next:** Done, don't push back (processing complete)
 
 ### 5. Build Dependencies Handling
 
 **Critical**: Build dependencies must complete BEFORE building the package.
 
-**Two-phase approach:**
+**Two-phase approach (within linear progression):**
 
 1. **EXTRACT_BUILD_DEPS phase**: Collect and push build dependencies to stack
 
+   - Skip if `item.skip_processing == True`
    - Extract BUILD_SYSTEM, BUILD_BACKEND, BUILD_SDIST dependencies (3 separate calls)
    - Push build deps to work stack in reverse order: SDIST, BACKEND, SYSTEM
-   - Push current item back with phase = BUILD_PACKAGE
+   - Push current item back with `phase = BUILD_PACKAGE`
    - Return (let stack process build deps)
 
 2. **BUILD_PACKAGE phase**: Build the package (all build deps now complete)
 
+   - Skip if `item.skip_processing == True`
    - At this point, all build dependencies have been processed to completion
    - Call `_build_package()` to build sdist and/or wheel
+   - Respects `item.build_sdist_only` flag
    - Advance to EXTRACT_INSTALL_DEPS
 
 **Stack ordering ensures correctness:**
 
-- LIFO stack pops SYSTEM first → builds to completion (including its deps)
-- Then pops BACKEND → builds to completion
-- Then pops SDIST → builds to completion
+- LIFO stack pops SYSTEM first → processes through all 9 phases → completes
+- Then pops BACKEND → processes through all 9 phases → completes
+- Then pops SDIST → processes through all 9 phases → completes
 - Finally pops parent item in BUILD_PACKAGE phase → all build deps are ready
 
 **Example stack flow:**
@@ -228,10 +262,10 @@ Phase handlers modify `item` in place and append to `work_stack` directly. They 
 ```
 Initial: [parent@EXTRACT_BUILD_DEPS]
 After EXTRACT_BUILD_DEPS: [parent@BUILD_PACKAGE, SDIST@GRAPH_UPDATE, BACKEND@GRAPH_UPDATE, SYSTEM@GRAPH_UPDATE]
-Pop SYSTEM → process fully → complete
-Pop BACKEND → process fully → complete
-Pop SDIST → process fully → complete
-Pop parent@BUILD_PACKAGE → build with all deps available
+Pop SYSTEM → flows through all 9 phases → completes
+Pop BACKEND → flows through all 9 phases → completes
+Pop SDIST → flows through all 9 phases → completes
+Pop parent@BUILD_PACKAGE → build with all deps available → continues to EXTRACT_INSTALL_DEPS → ... → COMPLETE
 ```
 
 ### 6. Install Dependencies Handling
@@ -571,6 +605,56 @@ This preserves exact behavior for:
 2. Measure memory usage (should be similar or better)
 3. Profile for bottlenecks if needed
 
+## Work Item Lifecycle Example
+
+**Example 1: New package (not seen before)**
+
+```
+Item: requests-2.31.0, skip_processing=False
+
+GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK
+SEEN_CHECK:       Not in _seen_requirements → mark as seen → skip_processing=False → advance to EXTRACT_BUILD_DEPS
+EXTRACT_BUILD_DEPS: Extract build deps → push deps to stack → advance to BUILD_PACKAGE
+BUILD_PACKAGE:    Build sdist and wheel → advance to EXTRACT_INSTALL_DEPS
+EXTRACT_INSTALL_DEPS: Extract install deps → advance to BUILD_ORDER
+BUILD_ORDER:      Add to build-order.json → advance to PROCESS_INSTALL
+PROCESS_INSTALL:  Push install deps to stack (loop if multiple) → advance to CLEANUP
+CLEANUP:          Clean build dirs → advance to COMPLETE
+COMPLETE:         Update progress bar → done
+```
+
+**Example 2: Already seen package (duplicate dependency)**
+
+```
+Item: urllib3-2.0.0, skip_processing=False
+
+GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK
+SEEN_CHECK:       Found in _seen_requirements → skip_processing=True → advance to EXTRACT_BUILD_DEPS
+EXTRACT_BUILD_DEPS: skip_processing=True → do nothing → advance to BUILD_PACKAGE
+BUILD_PACKAGE:    skip_processing=True → do nothing → advance to EXTRACT_INSTALL_DEPS
+EXTRACT_INSTALL_DEPS: skip_processing=True → do nothing → advance to BUILD_ORDER
+BUILD_ORDER:      skip_processing=True → do nothing → advance to PROCESS_INSTALL
+PROCESS_INSTALL:  skip_processing=True → do nothing → advance to CLEANUP
+CLEANUP:          skip_processing=True → do nothing → advance to COMPLETE
+COMPLETE:         Update progress bar → done
+```
+
+**Example 3: sdist_only mode**
+
+```
+Item: numpy-1.24.0, skip_processing=False, build_sdist_only=True
+
+GRAPH_UPDATE:     Add edge to graph → advance to SEEN_CHECK
+SEEN_CHECK:       Not in _seen_requirements → mark as seen (sdist only) → skip_processing=False → advance to EXTRACT_BUILD_DEPS
+EXTRACT_BUILD_DEPS: Extract build deps → push deps to stack → advance to BUILD_PACKAGE
+BUILD_PACKAGE:    build_sdist_only=True → build only sdist, skip wheel → advance to EXTRACT_INSTALL_DEPS
+EXTRACT_INSTALL_DEPS: Extract install deps from sdist → advance to BUILD_ORDER
+BUILD_ORDER:      Add to build-order.json → advance to PROCESS_INSTALL
+PROCESS_INSTALL:  Push install deps to stack → advance to CLEANUP
+CLEANUP:          Clean build dirs → advance to COMPLETE
+COMPLETE:         Update progress bar → done
+```
+
 ## Additional Implementation Details
 
 ### Seen Requirements Tracking
@@ -618,6 +702,26 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 - Future optimizations
 - Debugging
 
+### Linear Phase Progression Benefits
+
+**Design choice:** Every work item flows through all 9 phases sequentially, even if some phases become no-ops.
+
+**Benefits:**
+
+1. **Simplicity**: No complex conditional phase transitions to reason about
+2. **Predictability**: Every item follows the same path (GRAPH_UPDATE → ... → COMPLETE)
+3. **Debugging**: Can trace any item through standard flow
+4. **Settings handling**: Each phase checks `item.skip_processing` or `item.build_sdist_only` internally
+
+**How modes are handled:**
+
+- **Already seen packages**: `skip_processing = True` in SEEN_CHECK, later phases become no-ops
+- **sdist_only mode**: BUILD_PACKAGE checks `item.build_sdist_only` flag and skips wheel build
+- **Test mode errors**: EXTRACT_INSTALL_DEPS catches exceptions, uses empty list, continues to next phase
+- **Multiple versions**: Each version is independent work item flowing through same phases
+
+**No special-case transitions needed** - the linear flow handles all modes cleanly.
+
 ### Test Mode Error Handling
 
 **Multiple error types** recorded in `self.failed_packages`:
@@ -632,15 +736,17 @@ SeenKey = tuple[NormalizedName, tuple[str, ...], str, typing.Literal["sdist", "w
 
 ## Edge Cases Handled
 
-1. **Cyclic dependencies**: Prevented by `_seen_requirements` set (unchanged behavior)
-2. **Multiple versions mode**: Each version is independent work item with own error handling
-3. **Test mode fallback**: Build failures trigger prebuilt fallback within `_build_package()`
-4. **Git URL requirements**: Resolution unchanged, happens before work item creation
-5. **Deep chains**: Work stack on heap, no recursion limit
-6. **Progress bar**: Uses COMPLETE phase to update after each package completes, matching recursive behavior exactly
-7. **Build/install dep ordering**: LIFO stack with correct push order ensures correct processing order
-8. **Self.why management**: Main loop handles push/pop with error safety, preserves dependency chain tracking
-9. **Memory usage**: Each work item stores `why_snapshot` copy. For very wide trees (thousands of parallel deps), memory usage increases linearly with width, but should be acceptable for typical Python packages
+01. **Cyclic dependencies**: Prevented by `_seen_requirements` set (unchanged behavior)
+02. **Multiple versions mode**: Each version is independent work item with own error handling
+03. **Test mode fallback**: Build failures trigger prebuilt fallback within `_build_package()`
+04. **sdist_only mode**: BUILD_PACKAGE phase checks `item.build_sdist_only` flag and skips wheel build; linear progression continues normally
+05. **Already seen packages**: SEEN_CHECK sets `skip_processing = True`, subsequent phases become no-ops but item still flows through all phases
+06. **Git URL requirements**: Resolution unchanged, happens before work item creation
+07. **Deep chains**: Work stack on heap, no recursion limit
+08. **Progress bar**: Uses COMPLETE phase to update after each package completes, matching recursive behavior exactly
+09. **Build/install dep ordering**: LIFO stack with correct push order ensures correct processing order
+10. **Self.why management**: Main loop handles push/pop with error safety, preserves dependency chain tracking
+11. **Memory usage**: Each work item stores `why_snapshot` copy. For very wide trees (thousands of parallel deps), memory usage increases linearly with width, but should be acceptable for typical Python packages
 
 ## Rollback Plan
 
