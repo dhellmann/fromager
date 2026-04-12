@@ -25,6 +25,15 @@ This approach:
 
 ## Implementation Design
 
+### 0. Required Imports
+
+Add these imports to `src/fromager/bootstrapper.py`:
+
+```python
+import dataclasses
+from enum import StrEnum  # Python 3.11+ (or use `class BootstrapPhase(str, Enum)` for 3.9+)
+```
+
 ### 1. Work Item Structure
 
 Add a new dataclass to represent each package version to bootstrap:
@@ -72,7 +81,16 @@ class BootstrapPhase(StrEnum):
     COMPLETE = "complete"                 # Clean up and update progress bar
 ```
 
-### 3. Main Iterative Loop
+### 3. External Interface (Unchanged)
+
+The `bootstrap()` method maintains the same signature and behavior from the caller's perspective:
+
+- **Input:** `bootstrap(req: Requirement, req_type: RequirementType) -> None`
+- **Output:** None (modifies internal state, writes to files)
+- **Behavior:** Bootstraps a package and all its dependencies
+- **External callers:** No changes required in `commands/bootstrap.py` or other callers
+
+### 4. Main Iterative Loop
 
 Replace recursive `bootstrap()` with iterative loop:
 
@@ -85,19 +103,13 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
         return_all_versions=self.multiple_versions
     )
 
-    # Create initial work items (reverse order for LIFO stack)
-    work_stack: list[BootstrapWorkItem] = []
-    for source_url, resolved_version in reversed(resolved_versions):
-        work_stack.append(BootstrapWorkItem(
-            req=req,
-            req_type=req_type,
-            source_url=source_url,
-            resolved_version=resolved_version,
-            parent=self._get_current_parent(),
-            why_snapshot=self.why.copy(),
-            build_sdist_only=self._should_build_sdist_only(req_type),
-            phase=BootstrapPhase.START,
-        ))
+    # Create initial work items using helper function
+    work_stack = self._create_work_items_from_versions(
+        req=req,
+        req_type=req_type,
+        resolved_versions=resolved_versions,
+        build_sdist_only=self._should_build_sdist_only(req_type),
+    )
 
     # Process work stack (LIFO = depth-first)
     while work_stack:
@@ -146,7 +158,10 @@ Phase handlers modify `item` in place and return a list of work items to add to 
 3. Otherwise, advance `item.phase` to next phase
 4. Return list of items to add to stack:
    - Usually `[item]` (current item with next phase)
-   - May include dependency items: `[item, dep1, dep2, ...]` (in reverse order for LIFO)
+   - May include dependency items: `[item] + dep_items`
+     - **LIFO ordering**: `item` goes first (bottom of stack), deps after (top of stack)
+     - **Stack pops deps first** (they're on top), processes them to completion
+     - **Then pops item** to continue to next phase
    - Return `[]` to stop processing this item
 
 #### Phase Handlers:
@@ -173,6 +188,8 @@ Phase handlers modify `item` in place and return a list of work items to add to 
     - Build deps pop in correct order (SYSTEM, BACKEND, SDIST) and complete before parent continues
   - **Next:** Advance to BUILD_PACKAGE
   - **Return:** `[item] + build_dep_items`
+    - `item` goes on stack first (bottom), deps on top
+    - LIFO stack pops deps first, then item continues
 
 - **`_phase_build_package()`**: Build the package and record in build order
 
@@ -180,7 +197,7 @@ Phase handlers modify `item` in place and return a list of work items to add to 
     - Call `_build_package()` to build sdist and/or wheel
     - Respects `item.build_sdist_only` flag (skip wheel if True)
     - Store result in `item.build_result`
-    - Call `self.build_order.append()` to record in build-order.json
+    - Call `self._add_to_build_order()` to record in build-order.json
   - **Next:** Advance to EXTRACT_INSTALL_DEPS
   - **Return:** `[item]`
 
@@ -196,6 +213,8 @@ Phase handlers modify `item` in place and return a list of work items to add to 
       - Stack handles depth-first processing automatically
   - **Next:** Advance to COMPLETE
   - **Return:** `[item] + dep_items` (all dependency work items at once)
+    - `item` goes on stack first (bottom), deps on top
+    - LIFO stack pops deps first, then item continues to COMPLETE
 
 - **`_phase_complete()`**: Clean up and mark package complete
 
@@ -205,6 +224,93 @@ Phase handlers modify `item` in place and return a list of work items to add to 
   - **Next:** Done
   - **Return:** `[]` ← **End of pipeline! Don't add back to stack**
   - Main loop sees `[]` and calls `progressbar.update()` (work item done)
+
+#### Phase Dispatcher Implementation
+
+Add `_process_phase()` method to dispatch to appropriate phase handler:
+
+```python
+def _process_phase(self, item: BootstrapWorkItem) -> list[BootstrapWorkItem]:
+    """Dispatch to appropriate phase handler based on item.phase.
+
+    Returns list of work items to add to the stack.
+    """
+    if item.phase == BootstrapPhase.START:
+        return self._phase_start(item)
+    elif item.phase == BootstrapPhase.EXTRACT_BUILD_DEPS:
+        return self._phase_extract_build_deps(item)
+    elif item.phase == BootstrapPhase.BUILD_PACKAGE:
+        return self._phase_build_package(item)
+    elif item.phase == BootstrapPhase.EXTRACT_INSTALL_DEPS:
+        return self._phase_extract_install_deps(item)
+    elif item.phase == BootstrapPhase.COMPLETE:
+        return self._phase_complete(item)
+    else:
+        raise ValueError(f"Unknown phase: {item.phase}")
+```
+
+#### Parent Context Helper
+
+Add `_get_current_parent()` helper method for extracting parent from `self.why`:
+
+```python
+def _get_current_parent(self) -> tuple[Requirement, Version] | None:
+    """Extract parent requirement and version from self.why stack.
+
+    Returns None if self.why is empty (root package).
+    Returns (parent_req, parent_version) if non-empty.
+    """
+    if not self.why:
+        return None
+    _, parent_req, parent_version = self.why[-1]
+    return (parent_req, parent_version)
+```
+
+#### Work Item Creation Helper
+
+Add `_create_work_items_from_versions()` helper to reduce code duplication:
+
+```python
+def _create_work_items_from_versions(
+    self,
+    req: Requirement,
+    req_type: RequirementType,
+    resolved_versions: list[tuple[str, Version]],
+    build_sdist_only: bool = False,
+) -> list[BootstrapWorkItem]:
+    """Create work items from resolved versions in reverse order for LIFO.
+
+    Args:
+        req: The requirement to create work items for
+        req_type: Type of requirement (INSTALL, BUILD_SYSTEM, etc.)
+        resolved_versions: List of (source_url, version) tuples
+        build_sdist_only: If True, only build sdist (skip wheel)
+
+    Returns:
+        List of work items in reverse order (for LIFO stack)
+    """
+    work_items = []
+    for source_url, resolved_version in reversed(resolved_versions):
+        work_items.append(BootstrapWorkItem(
+            req=req,
+            req_type=req_type,
+            source_url=source_url,
+            resolved_version=resolved_version,
+            parent=self._get_current_parent(),
+            why_snapshot=self.why.copy(),
+            build_sdist_only=build_sdist_only,
+            phase=BootstrapPhase.START,
+        ))
+    return work_items
+```
+
+**Usage locations:**
+
+1. `bootstrap()` method - creating initial work items
+2. `_phase_extract_build_deps()` - creating build dependency work items (3 calls)
+3. `_phase_extract_install_deps()` - creating install dependency work items
+
+This eliminates code duplication and ensures consistent work item creation.
 
 ### 5. Build Dependencies Handling
 
@@ -260,22 +366,20 @@ def _phase_extract_install_deps(self, item):
     install_dependencies = self._get_install_dependencies(...)
     self.progressbar.update_total(len(install_dependencies))
 
-    # Create ALL dependency work items at once
+    # Create ALL dependency work items at once using helper
     dep_items = []
     for dep in reversed(install_dependencies):  # Reverse for depth-first
         resolved_versions = self.resolve_versions(
             req=dep, req_type=RequirementType.INSTALL,
             return_all_versions=self.multiple_versions
         )
-        for source_url, resolved_version in reversed(resolved_versions):
-            dep_items.append(BootstrapWorkItem(
-                req=dep,
-                resolved_version=resolved_version,
-                parent=(item.req, item.resolved_version),
-                why_snapshot=self.why.copy(),
-                phase=BootstrapPhase.START,
-                ...
-            ))
+        # Use helper to create work items for this dependency
+        dep_items.extend(self._create_work_items_from_versions(
+            req=dep,
+            req_type=RequirementType.INSTALL,
+            resolved_versions=resolved_versions,
+            build_sdist_only=False,
+        ))
 
     item.phase = BootstrapPhase.COMPLETE
     return [item] + dep_items  # Stack handles depth-first
@@ -356,6 +460,23 @@ Result: 100% complete ✓
 ```
 
 **Result**: Progress bar behaves identically to recursive version—updates after each package completes (including all its work and transitive dependencies).
+
+**Initialization fix required:**
+
+The current recursive implementation in `commands/bootstrap.py` initializes the progress bar with `total=len(to_build) * 2`, which is a quirk of the recursive version (counts both sdist and wheel builds separately). The iterative version should:
+
+1. Initialize with the actual number of initial work items created
+2. Let `update_total()` calls during processing handle discovered dependencies
+3. This fixes a semantic mismatch and makes the progress bar more accurate
+
+Example:
+
+```python
+# In commands/bootstrap.py bootstrap() function:
+# Before: progress = ProgressReporter(total=len(to_build) * 2)
+# After:  progress = ProgressReporter(total=len(to_build))
+# (Each package is one work item, dependencies discovered dynamically)
+```
 
 ### 8. Error Handling Preservation
 
@@ -454,7 +575,8 @@ When a package fails, its dependencies may already be on the work stack. Use **l
     - `_phase_complete()`
   - Add `_process_phase()` dispatcher method
   - Add `_handle_bootstrap_error()` error handling method
-  - Add `_get_current_parent()` helper (if doesn't exist) for extracting parent from `self.why`
+  - Add `_get_current_parent()` helper for extracting parent from `self.why`
+  - Add `_create_work_items_from_versions()` helper for creating work items from resolved versions
   - Update main loop with error handling and self.why management
 
 **Reference files (read-only, for patterns):**
@@ -469,42 +591,47 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 ## Implementation Steps
 
-### Step 1: Add Data Structures (Low Risk)
+**Direct replacement approach:** This is a pure refactoring (behavior-preserving change), so we'll replace the recursive implementation with the iterative version in one change. The comprehensive test suite provides sufficient safety net.
 
-- Add `BootstrapPhase` enum (5 phases including COMPLETE)
+### Step 1: Add Data Structures
+
+- Add required imports: `dataclasses`, `StrEnum` (or `str, Enum` for Python 3.9+)
+- Add `BootstrapPhase` enum (5 phases)
 - Add `BootstrapWorkItem` dataclass
-- No behavior changes, not called yet
+- Run type check: `hatch run mypy:check src/fromager/bootstrapper.py`
 
-### Step 2: Add Phase Handler Methods (Low Risk)
+### Step 2: Add Phase Handler Methods
 
-- Implement all 9 `_phase_*()` methods by extracting logic from `_bootstrap_impl()`
-- Implement `_process_phase()` dispatcher and `_handle_bootstrap_error()` helper
-- Not called yet, no behavior changes
+- Implement 5 `_phase_*()` methods by extracting logic from existing code:
+  - `_phase_start()` - from `_bootstrap_impl()` lines 392-405
+  - `_phase_extract_build_deps()` - from `_handle_build_requirements()` lines 696-709
+  - `_phase_build_package()` - from `_bootstrap_impl()` lines 406-470
+  - `_phase_extract_install_deps()` - from `_bootstrap_impl()` lines 480-526
+  - `_phase_complete()` - new cleanup phase
+- Implement `_process_phase()` dispatcher
+- Implement `_get_current_parent()` helper
+- Implement `_create_work_items_from_versions()` helper
+- Run type check: `hatch run mypy:check src/fromager/bootstrapper.py`
 
-### Step 3: Add Feature Flag (Low Risk)
+### Step 3: Replace bootstrap() Method
 
-- Add `use_iterative: bool = False` parameter to `__init__()`
-- Keep `_bootstrap_impl()` as `_bootstrap_recursive()`
-- Add new `_bootstrap_iterative()` with work loop
-- Route through feature flag in `bootstrap()`
+- Replace `bootstrap()` method with iterative implementation (main loop)
+- Remove `_bootstrap_single_version()`, `_bootstrap_impl()`, `_handle_build_requirements()`
+- Update `commands/bootstrap.py` progress bar initialization to count actual initial work items
+- Run type check and lint: `hatch run mypy:check && hatch run lint:fix`
 
-### Step 4: Test with Flag Enabled (Medium Risk)
+### Step 4: Run Tests and Verify
 
-- Run full test suite with `use_iterative=True`
-- Compare outputs (build-order.json, graph.json) with recursive version
-- Fix any issues found
+- Run file-scoped tests: `hatch run test:test tests/test_bootstrapper.py -v`
+- Run full test suite: `hatch run test:test`
+- Run e2e tests: `hatch run test:test e2e/`
+- All tests must pass unchanged
 
-### Step 5: Enable by Default (Medium Risk)
+### Step 5: Commit Changes
 
-- Change default to `use_iterative=True`
-- Run full test suite and e2e tests
-- Monitor for any issues
-
-### Step 6: Remove Recursive Code (Low Risk)
-
-- Remove `_bootstrap_recursive()`, `_bootstrap_single_version()`, `_handle_build_requirements()`
-- Remove feature flag
-- Rename `_bootstrap_iterative()` to `bootstrap()`
+- Use conventional commit format: `refactor(bootstrapper): convert from recursive to iterative`
+- Include signed-off-by: `git commit -s`
+- Reference any related issues
 
 ## Self.why Stack Management
 
@@ -577,44 +704,99 @@ This preserves exact behavior for:
 
 ### Functional Testing
 
-1. Run full test suite: `hatch run test:test`
-2. Run e2e tests: `hatch run test:test e2e/`
-3. All tests must pass unchanged
+Run the complete test suite to verify all existing behavior is preserved:
 
-### Equivalence Testing
+```bash
+# Run specific bootstrapper tests with verbose output
+hatch run test:test tests/test_bootstrapper.py -v
 
-1. Bootstrap same package set with recursive (flag off) and iterative (flag on)
-2. Compare `build-order.json` - must be identical
-3. Compare `dependency-graph.json` - must be identical
-4. Compare log output - order should match
-5. Compare failure reports in test mode
-6. Compare failed versions list in multiple-versions mode
+# Run specific test function
+hatch run test:test tests/test_bootstrapper.py::test_multiple_versions_continues_on_error -v
+
+# Run with debug logging
+hatch run test:test tests/test_bootstrapper.py --log-level DEBUG
+
+# Run full test suite
+hatch run test:test
+
+# Run e2e tests
+hatch run test:test e2e/
+```
+
+All tests must pass unchanged.
+
+### Type Checking and Linting
+
+```bash
+# Type check bootstrapper file
+hatch run mypy:check src/fromager/bootstrapper.py
+
+# Format code
+hatch run lint:fix src/fromager/bootstrapper.py
+
+# Run all quality checks
+hatch run lint:fix && hatch run test:test && hatch run mypy:check && hatch run lint:check
+```
 
 ### Error Mode Testing
+
+Verify all error handling modes work correctly:
 
 1. **Normal mode:** Verify fail-fast still works (exception propagates immediately)
 2. **Test mode:**
    - Verify prebuilt fallback works for build failures
    - Verify non-fatal errors (hooks, deps) are recorded but continue
    - Verify failure report JSON is written
+   - Test coverage: `tests/test_bootstrap_test_mode.py`
 3. **Multiple versions mode:**
    - Verify all matching versions are processed
    - Verify failures are recorded per-version
    - Verify failed nodes are removed from graph
    - Verify other versions continue after one fails
+   - Test coverage: `test_multiple_versions_continues_on_error`
 
-### Stress Testing
+### Stress Testing (Recommended Before Production Use)
 
-1. Bootstrap package with 1000+ transitive dependencies
-2. Bootstrap package with 500-level deep dependency chain
-3. Verify no stack overflow
-4. Verify reasonable memory usage
+Test scenarios not explicitly covered by current test suite:
+
+**1. Deep recursion chains:**
+
+Create test with 500+ level deep dependency chain:
+
+- Previous recursive implementation would hit stack overflow
+- Verify iterative version handles it without issues
+- Check memory usage stays reasonable
+
+**2. Wide dependency trees:**
+
+Test package with 100+ direct dependencies:
+
+- Verify work stack doesn't grow excessively
+- Monitor memory usage (each work item ~500 bytes)
+- 1000 parallel deps ≈ 500KB additional memory (acceptable)
+
+**3. Circular dependencies:**
+
+Verify `_seen_requirements` prevents infinite loops:
+
+- Already tested implicitly by existing test suite
+- Document expected behavior for manual verification
+
+**4. Large multiple versions:**
+
+Test with package having 50+ matching versions:
+
+- Current tests only cover 2-3 versions
+- Verify performance remains acceptable
+- Check that all versions are processed or errors recorded
 
 ### Performance Testing
 
-1. Compare execution time (should be similar, maybe slightly slower)
-2. Measure memory usage (should be similar or better)
-3. Profile for bottlenecks if needed
+Compare with historical baselines:
+
+1. **Execution time:** Should be similar (within 10% of typical runs)
+2. **Memory usage:** Should be similar or better than recursive version
+3. **Profile if needed:** Use Python profiler to identify any bottlenecks
 
 ## Work Item Lifecycle Example
 
@@ -750,12 +932,15 @@ Used in the START phase to break cycles and avoid redundant work.
 
 ## Rollback Plan
 
-Feature flag approach allows easy rollback:
+Git history provides rollback capability:
 
-- If issues found, default `use_iterative=False`
-- Keep both paths until iterative version proven stable
-- Can A/B compare outputs to debug discrepancies
-- Eventually remove recursive path once confident
+- **If issues discovered:** Use `git revert` to roll back the commit
+- **Git provides:** Complete history of recursive implementation for reference
+- **Test suite provides:** Safety net to catch issues before merge
+- **No feature flag needed:** This is a pure refactoring (behavior-preserving change)
+  - Feature flags make sense for behavior changes
+  - For refactoring, passing tests = correct implementation
+  - Keeping both implementations doubles maintenance burden unnecessarily
 
 ## Success Criteria
 
