@@ -81,6 +81,43 @@ class BootstrapPhase(StrEnum):
     COMPLETE = "complete"                 # Clean up and update progress bar
 ```
 
+**Phase Flow Diagram:**
+
+```
+Work Item Flow (Linear Pipeline with Early Exit):
+
+┌─────────────┐
+│   START     │ Check if already seen
+└──────┬──────┘
+       │ not seen
+       ├─[already seen]─→ return [] → main loop calls update() → done
+       │
+       ▼
+┌─────────────────────┐
+│ EXTRACT_BUILD_DEPS  │ Collect build dependencies
+└──────┬──────────────┘
+       │ return [item] + build_deps
+       │ (build deps process to completion first)
+       ▼
+┌─────────────────┐
+│ BUILD_PACKAGE   │ Build sdist and/or wheel
+└──────┬──────────┘
+       │ return [item]
+       ▼
+┌────────────────────────┐
+│ EXTRACT_INSTALL_DEPS   │ Collect install dependencies
+└──────┬─────────────────┘
+       │ return [item] + install_deps
+       │ (install deps process to completion first)
+       ▼
+┌──────────┐
+│ COMPLETE │ Cleanup
+└──────┬───┘
+       │ return []
+       ▼
+   main loop calls update() → done
+```
+
 ### 3. External Interface (Unchanged)
 
 The `bootstrap()` method maintains the same signature and behavior from the caller's perspective:
@@ -117,46 +154,68 @@ def bootstrap(self, req: Requirement, req_type: RequirementType) -> None:
 
         # Restore dependency chain context
         self.why = item.why_snapshot.copy()
-        self.why.append((item.req_type, item.req, item.resolved_version))
 
-        try:
-            # Process current phase - returns items to add to stack
-            new_items = self._process_phase(item)
-            work_stack.extend(new_items)
+        # Use existing context manager for self.why management (reuse existing code)
+        with self._track_why(item.req_type, item.req, item.resolved_version):
+            try:
+                # Process current phase - returns items to add to stack
+                new_items = self._process_phase(item)
+                work_stack.extend(new_items)
 
-            # Update progress bar based on return value
-            if len(new_items) == 0:
-                # Work completed (already seen or finished)
-                self.progressbar.update()
-            elif len(new_items) == 1:
-                # Same item continuing to next phase - no change to total
-                pass
-            else:
-                # Created dependencies: n items returned means n-1 net new work
-                self.progressbar.update_total(len(new_items) - 1)
-        except Exception as err:
-            # Handle error - may return items to continue processing
-            new_items = self._handle_bootstrap_error(item, err)
-            work_stack.extend(new_items)
-
-            # Update progress bar based on return value
-            if len(new_items) == 0:
-                self.progressbar.update()
-            elif len(new_items) == 1:
-                pass
-            else:
-                self.progressbar.update_total(len(new_items) - 1)
-        finally:
-            self.why.pop()
+                # Update progress bar based on return value
+                if len(new_items) == 0:
+                    # Work completed (already seen or finished)
+                    self.progressbar.update()
+                elif len(new_items) == 1:
+                    # Same item continuing to next phase - no change to total
+                    pass
+                else:
+                    # Created dependencies: n items returned means n-1 net new work
+                    self.progressbar.update_total(len(new_items) - 1)
+            except Exception as err:
+                # Error handling - don't add anything to stack
+                if self.test_mode:
+                    self._record_test_mode_failure(
+                        item.req, str(item.resolved_version), err, "bootstrap"
+                    )
+                    # Still update progress - work item processed (failed)
+                    self.progressbar.update()
+                elif self.multiple_versions:
+                    pkg_name = canonicalize_name(item.req.name)
+                    self._failed_versions.append((pkg_name, str(item.resolved_version), err))
+                    self.ctx.dependency_graph.remove_dependency(pkg_name, item.resolved_version)
+                    self.ctx.write_to_graph_to_file()
+                    # Still update progress - work item processed (failed)
+                    self.progressbar.update()
+                else:
+                    raise  # Fail-fast in normal mode
 ```
 
 ### 4. Phase Processing
 
 **Linear progression with early exit:** Work items flow through phases linearly. START acts as a filter - if a package has already been processed, it returns `[]` and the item stops flowing through the pipeline.
 
-**Function signature:** `def _phase_X(self, item: BootstrapWorkItem) -> list[BootstrapWorkItem]:`
+**Phase Handler Contract:**
 
-Phase handlers modify `item` in place and return a list of work items to add to the stack. The main loop extends the work stack with the returned items.
+```python
+def _phase_X(self, item: BootstrapWorkItem) -> list[BootstrapWorkItem]:
+    """Phase handler contract.
+
+    Each phase handler:
+    1. Performs phase-specific work (extract deps, build package, etc.)
+    2. Modifies item.phase in-place to advance to next phase
+    3. Returns list of work items to add to stack:
+       - [] = stop processing this item (already seen or complete)
+       - [item] = continue item to next phase
+       - [item] + dep_items = add dependencies and continue
+         (deps on top of stack due to LIFO, processed first)
+
+    Phase handlers MUST NOT:
+    - Update progress bar (main loop handles this)
+    - Manipulate self.why (main loop handles this)
+    - Manipulate work_stack (main loop handles this)
+    """
+```
 
 **Phase handler patterns:**
 
@@ -325,6 +384,16 @@ This eliminates code duplication and ensures consistent work item creation.
 
 **Critical**: Build dependencies must complete BEFORE building the package.
 
+**Build Dependency Ordering:**
+
+Build dependencies have strict ordering requirements because each type needs the previous types installed:
+
+1. **BUILD_SYSTEM** must be installed before querying build backend
+2. **BUILD_BACKEND** requirements need build system installed
+3. **BUILD_SDIST** requirements need both above installed
+
+We create work items in **REVERSE order** (SDIST, BACKEND, SYSTEM) so the LIFO stack pops them in **CORRECT order** (SYSTEM, BACKEND, SDIST). Each build dep flows through all 5 phases to completion before the next.
+
 **Two-phase approach (within linear progression):**
 
 1. **EXTRACT_BUILD_DEPS phase**: Collect and return build dependencies
@@ -485,22 +554,35 @@ Logic: Same work continuing, not creating new work ✓
 
 **Result**: Progress bar behaves identically to recursive version—updates after each package completes, total grows as dependencies are discovered.
 
-**Initialization fix required:**
+#### Shared Dependencies and Progress Tracking
 
-The current recursive implementation in `commands/bootstrap.py` initializes the progress bar with `total=len(to_build) * 2`, which is a quirk of the recursive version (counts both sdist and wheel builds separately). The iterative version should:
+**Important**: Because the dependency graph is discovered dynamically and dependencies can be shared, multiple work items may be created for the same package version.
 
-1. Initialize with the actual number of initial work items created
-2. Let `update_total()` calls during processing handle discovered dependencies
-3. This fixes a semantic mismatch and makes the progress bar more accurate
+**Example**: If packages A and B both depend on C, the work stack will have:
 
-Example:
+- Work item for C created by A's EXTRACT_INSTALL_DEPS phase
+- Work item for C created by B's EXTRACT_INSTALL_DEPS phase
 
-```python
-# In commands/bootstrap.py bootstrap() function:
-# Before: progress = ProgressReporter(total=len(to_build) * 2)
-# After:  progress = ProgressReporter(total=len(to_build))
-# (Each package is one work item, dependencies discovered dynamically)
-```
+**Behavior**:
+
+1. Both work items are added to stack and increment progress total
+2. First work item for C (whichever is popped first) builds the package and marks it as seen
+3. Second work item for C hits the `_has_been_seen()` check in START phase and returns []
+4. **Both work items increment progress** when they complete (return [])
+
+**Why this is correct**: Progress tracks "dependency work items processed", not "unique packages built". Each work item represents work to verify a dependency is satisfied, even if the package was already built by another work item.
+
+**Progress bar semantics**: "N of M dependency relationships satisfied"
+
+- M grows as dependencies are discovered (via `update_total()`)
+- N increments for each work item completed (via `update()`)
+- Multiple work items for same package are legitimate (shared dependencies)
+
+#### Progress Bar Initialization
+
+**Keep unchanged**: The current recursive implementation in `commands/bootstrap.py` initializes the progress bar with `total=len(to_build) * 2`. This refactoring preserves existing behavior, so **keep this initialization unchanged**.
+
+Optimizing the progress bar initialization can be addressed in a separate PR after verifying the iterative version works correctly.
 
 ### 8. Error Handling Preservation
 
@@ -600,10 +682,10 @@ When a package fails, its dependencies may already be on the work stack. Use **l
     - `_phase_extract_install_deps()`
     - `_phase_complete()`
   - Add `_process_phase()` dispatcher method
-  - Add `_handle_bootstrap_error()` error handling method
   - Add `_get_current_parent()` helper for extracting parent from `self.why`
   - Add `_create_work_items_from_versions()` helper for creating work items from resolved versions
-  - Update main loop with error handling and self.why management
+  - Update main loop with error handling and self.why management (using existing `_track_why()` context manager)
+  - **Note**: `_build_stack` field (line 116) is unchanged - still used for build-order.json output via `_add_to_build_order()`
 
 **Reference files (read-only, for patterns):**
 
@@ -643,7 +725,7 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 - Replace `bootstrap()` method with iterative implementation (main loop)
 - Remove `_bootstrap_single_version()`, `_bootstrap_impl()`, `_handle_build_requirements()`
-- Update `commands/bootstrap.py` progress bar initialization to count actual initial work items
+- **Keep** `commands/bootstrap.py` progress bar initialization unchanged (preserve existing behavior)
 - Run type check and lint: `hatch run mypy:check && hatch run lint:fix`
 
 ### Step 4: Run Tests and Verify
@@ -663,15 +745,15 @@ When a package fails, its dependencies may already be on the work stack. Use **l
 
 **Challenge**: `self.why` is a shared stack tracking the current dependency chain. The recursive version manages it via the call stack.
 
-**Solution**: Snapshot and restore approach with main loop push/pop
+**Solution**: Snapshot and restore approach using existing `_track_why()` context manager
 
 1. Each work item captures `why_snapshot = self.why.copy()` at creation time (preserves parent context)
 2. Main loop restores parent context: `self.why = item.why_snapshot.copy()`
-3. Main loop pushes current item: `self.why.append((item.req_type, item.req, item.resolved_version))`
-4. Main loop pops current item in try/except/else for error safety
+3. Main loop uses existing `_track_why()` context manager to push/pop current item
+4. Context manager ensures cleanup even on exceptions (existing code, lines 527-543)
 5. **Phase handlers MUST NOT manipulate `self.why`** - they see current item already on the stack
 
-**Main loop handles ALL push/pop:**
+**Main loop uses existing context manager:**
 
 ```python
 while work_stack:
@@ -680,17 +762,21 @@ while work_stack:
     # Restore parent context from snapshot
     self.why = item.why_snapshot.copy()
 
-    # Push current item (main loop responsibility, not phase handler)
-    self.why.append((item.req_type, item.req, item.resolved_version))
-
-    try:
-        self._process_phase(item, work_stack)
-    except Exception as err:
-        self.why.pop()  # Cleanup on error
-        # ... handle error based on mode
-    else:
-        self.why.pop()  # Cleanup on success
+    # Use existing context manager (reuses existing code)
+    with self._track_why(item.req_type, item.req, item.resolved_version):
+        try:
+            new_items = self._process_phase(item)
+            work_stack.extend(new_items)
+            # ... handle progress bar updates ...
+        except Exception as err:
+            # ... handle error based on mode ...
 ```
+
+**Advantages of using existing context manager:**
+
+- Reuses existing, tested code
+- Ensures correct cleanup via try/finally
+- Same push/pop semantics as recursive version
 
 **When creating child work items (in phase handlers):**
 
