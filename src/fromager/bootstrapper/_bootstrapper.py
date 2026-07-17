@@ -935,11 +935,12 @@ class Bootstrapper:
         prebuilt: bool = False,
         constraint: Requirement | None = None,
     ) -> None:
-        """Append a package to the build-order output file if not already present.
+        """Append a package to the build-order list if not already present.
 
         Deduplicates by ``(canonicalized_name, version)`` so the same package
-        is never written twice, regardless of extras. On each new entry, the
-        full build-order list is written to ``self._build_order_filename``.
+        is never written twice, regardless of extras. Data is buffered in
+        memory and written to ``self._build_order_filename`` once during
+        ``finalize()``.
 
         Args:
             req: The requirement being added to the build order.
@@ -985,7 +986,12 @@ class Bootstrapper:
             fut.add_done_callback(self._check_write_error)
 
     def _write_graph_async(self) -> None:
-        """Serialize the dependency graph on the main thread, write it in background."""
+        """Serialize the dependency graph on the main thread, write it in background.
+
+        Must only be called from the main thread. Serialization happens
+        synchronously here so the snapshot is consistent with the caller's
+        view of the graph; only the file I/O is offloaded to the write pool.
+        """
         buf = io.StringIO()
         self.ctx.dependency_graph.serialize(buf)
         self._schedule_write(self.ctx.graph_file, buf.getvalue())
@@ -1269,6 +1275,10 @@ class Bootstrapper:
         Reports failed versions in multiple versions mode.
         In test mode, writes failure report and returns non-zero if there were failures.
 
+        Note: I/O errors from background graph writes are logged at ERROR level
+        but are not raised. Check the log for ``"background file write failed"``
+        if the on-disk graph file is suspected to be stale.
+
         Returns:
             0 if all packages built successfully (or not in test/multiple versions mode)
             1 if any packages failed in test mode
@@ -1334,5 +1344,8 @@ class Bootstrapper:
             self._bg_pool.shutdown(wait=False, cancel_futures=True)
             self._bg_pool = None
         if self._write_pool is not None:
+            # Intentionally abandon any pending graph writes on error exit.
+            # A crashed or aborted run produces inconsistent state regardless;
+            # waiting for writes would only delay propagation of the exception.
             self._write_pool.shutdown(wait=False, cancel_futures=True)
             self._write_pool = None

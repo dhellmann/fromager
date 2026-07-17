@@ -799,6 +799,12 @@ def test_record_stack_state_throttled_when_called_rapidly(
     bt._record_stack_state([_make_resolve_item("pkgc")])
     second_mtime = bt._stack_filename.stat().st_mtime
 
+    # NOTE: This assertion compares st_mtime values for equality. On filesystems
+    # with coarse mtime resolution (e.g. 1-second), two calls that span a
+    # resolution boundary could produce equal mtimes even when the file was
+    # rewritten, or unequal mtimes when it was not. APFS (nanosecond resolution)
+    # makes this reliable in practice, but the test is inherently filesystem-
+    # dependent.
     assert first_mtime == second_mtime
 
 
@@ -823,6 +829,26 @@ def test_finalize_writes_build_order_and_graph(tmp_context: WorkContext) -> None
     contents = json.loads(bt._build_order_filename.read_text())
     assert len(contents) == 1
     assert contents[0]["dist"] == "mypkg"
+
+
+def test_check_write_error_logs_on_failure(
+    tmp_context: WorkContext, caplog: pytest.LogCaptureFixture
+) -> None:
+    """_check_write_error() logs an error when the background write future raises."""
+    bt = bootstrapper.Bootstrapper(tmp_context)
+
+    # Arrange: create a future that has already failed with an OSError
+    import concurrent.futures
+
+    fut: concurrent.futures.Future[int] = concurrent.futures.Future()
+    fut.set_exception(OSError("disk full"))
+
+    # Act
+    with caplog.at_level(logging.ERROR):
+        bt._check_write_error(fut)
+
+    # Assert: error is logged, not raised
+    assert any("disk full" in r.message for r in caplog.records)
 
 
 def test_bootstrap_calls_record_stack_state(tmp_context: WorkContext) -> None:
